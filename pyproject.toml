@@ -1,0 +1,27 @@
+[project]
+name = "inference-observe"
+version = "0.1.0"
+description = "Live flow board and advisor agents for LLM inference engines"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.11",
+    "tokenizers>=0.21",
+    "nvidia-ml-py>=12",
+    "uvloop>=0.21",
+]
+
+[project.scripts]
+io-proxy = "harness.proxy:main"
+io-replay = "harness.replay:main"
+io-traces = "harness.traces:main"
+io-collector = "harness.collector:main"
+io-advisor = "harness.advisor:main"
+io-replay-ws = "harness.replay_ws:main"
+io-mooncake = "harness.mooncake:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["harness"]

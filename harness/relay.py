@@ -4,7 +4,7 @@ The relay holds one connection to the collector and sends the same frames to eve
 only watch:
 - it serves GET /ws and nothing else;
 - it disconnects any viewer that sends data;
-- it caps viewers overall and per address;
+- it caps viewers overall and per address (IPv6 addresses count by /64);
 - it disconnects viewers that fall behind, so a slow or stalled client never grows memory;
 - it accepts browsers only from the listed origins (--allow-origin);
 - it removes local file paths from the stream.
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import time
 from collections import defaultdict, deque
@@ -107,9 +108,19 @@ class Relay:
 
     # ---- viewers ----------------------------------------------------------------------------
     def client_ip(self, request: web.Request) -> str:
+        """The viewer's address for the per-address cap. IPv6 counts by /64, the block one household or host holds."""
+        raw = request.remote or "?"
         if self.a.trust_cloudflare and request.headers.get("CF-Connecting-IP"):
-            return request.headers["CF-Connecting-IP"].strip()
-        return request.remote or "?"
+            raw = request.headers["CF-Connecting-IP"].strip()
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            return raw
+        if isinstance(ip, ipaddress.IPv6Address):
+            if ip.ipv4_mapped:
+                return str(ip.ipv4_mapped)
+            return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+        return str(ip)
 
     async def ws(self, request: web.Request) -> web.StreamResponse:
         origin = request.headers.get("Origin")

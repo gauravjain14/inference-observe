@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import re
+import socket
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -64,16 +65,20 @@ async def run(a: argparse.Namespace) -> None:
         await ws.send_str('{"type":"advisor.note","id":"probe","title":"probe"}')
         code = await closes(ws)
         check("a viewer that sends data is disconnected", code == 1008, f"close code {code}")
+    # one address family, so every connection comes from the same address
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(family=socket.AF_INET, force_close=True)) as s4:
         conns: list = []
         for _ in range(a.max_per_ip + 1):
             try:
-                conns.append(await s.ws_connect(a.feed, headers={"Origin": a.origin}))
+                conns.append(await s4.ws_connect(a.feed, headers={"Origin": a.origin}))
             except aiohttp.WSServerHandshakeError as e:
                 conns.append(e.status)
-        check(f"more than {a.max_per_ip} viewers from one address are refused", conns[-1] == 429, f"{conns[-1]}")
+        check(f"more than {a.max_per_ip} viewers from one address are refused", conns[-1] == 429,
+              f"{['ok' if not isinstance(c, int) else c for c in conns]}")
         for c in conns:
             if not isinstance(c, int):
                 await c.close()
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
         if a.page:
             async with s.get(a.page) as r:
                 html = await r.text()

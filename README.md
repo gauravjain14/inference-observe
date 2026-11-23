@@ -299,49 +299,49 @@ second.
 
 ## Host it publicly
 
-Only two things are public: the board, as static files on GitHub Pages, and a read-only copy of the stream
-through a Cloudflare tunnel. The engine, the proxy and the collector stay on `127.0.0.1`.
+The board goes on GitHub Pages and the live stream through a relay on Cloudflare: a Worker with one Durable
+Object, on the free plan. The engine's machine only connects outward: `io-push` sends the stream to the relay,
+and viewers read it from there. The engine, the proxy and the collector stay on `127.0.0.1`.
 
 ```
-browser ── board ─────────────── GitHub Pages
-   └──── wss://live.<domain>/ws ── Cloudflare tunnel ── io-relay :18240 ── collector :18220
+browser ── board ─────────────────── GitHub Pages
+   └──── wss://live.<domain>/ws ──── Cloudflare Worker relay ◄── io-push (outbound) ── collector :18220
 ```
 
-**1. Relay.** It holds one connection to the collector and sends the same frames to every viewer.
+**1. Relay on Cloudflare.** This needs a Cloudflare account with your domain on it.
 
 ```bash
-io-relay --upstream ws://127.0.0.1:18220/ws --port 18240 \
-  --allow-origin https://<user>.github.io --trust-cloudflare
+cd relay-worker
+npm install
+cp wrangler.toml wrangler.local.toml   # set ALLOWED_ORIGINS and the routes line for live.<domain>
+npx wrangler login
+npx wrangler deploy -c wrangler.local.toml
+mkdir -p ~/.config/inference-observe
+(umask 077; python3 -c "import secrets; print(secrets.token_urlsafe(48))" > ~/.config/inference-observe/push-token)
+tr -d '\n' < ~/.config/inference-observe/push-token | npx wrangler secret put INGEST_TOKEN -c wrangler.local.toml
 ```
 
-- It serves `GET /ws` and nothing else, and disconnects any viewer that sends data.
-- It accepts at most 200 viewers, and 4 per address (`--max-viewers`, `--max-per-ip`).
-- It drops viewers that fall behind, so a stalled client cannot grow its memory.
-- It accepts browsers only from the page's origin, and removes local file paths from the stream.
+If the deploy reports a missing `workers.dev` subdomain, open **Workers & Pages** in the Cloudflare dashboard
+once, then deploy again.
 
-**2. Tunnel.** This needs a Cloudflare account and a domain on Cloudflare.
+The relay:
+- serves `/ws` as a GET WebSocket only, to the page's origin;
+- disconnects any viewer that sends data;
+- accepts at most 200 viewers and 4 per address (IPv6 by /64), each for at most an hour (the board reconnects by
+  itself);
+- accepts `/ingest` only with the token, and answers every other request with 404;
+- forwards text without parsing it. `io-push` sends the state a joining viewer needs every 5 seconds.
+
+On the free plan:
+- `io-push` sends 4 batches a second, about 17,000 requests a day of the 100,000 allowed;
+- the relay stays active, using about 11,000 of the 13,000 GB-seconds allowed a day;
+- if a limit is reached, the board goes dark until 00:00 UTC.
+
+**2. Push from the engine's machine.** It reads the token from `~/.config/inference-observe/push-token`.
 
 ```bash
-cloudflared tunnel login
-cloudflared tunnel create inference-observe
-cloudflared tunnel route dns inference-observe live.<domain>
+io-push --relay wss://live.<domain>/ingest
 ```
-
-`~/.cloudflared/config.yml` sends `/ws` to the relay and answers everything else with 404:
-
-```yaml
-tunnel: inference-observe
-credentials-file: /home/<you>/.cloudflared/<tunnel-id>.json
-ingress:
-  - hostname: live.<domain>
-    path: ^/ws$
-    service: http://127.0.0.1:18240
-  - service: http_status:404
-```
-
-Check a rule with `cloudflared tunnel ingress rule https://live.<domain>/note` (it should match rule #1, the
-404). Run the tunnel with `cloudflared tunnel run inference-observe`, or install it as a service with
-`sudo cloudflared service install`.
 
 **3. Board on GitHub Pages.**
 
@@ -371,12 +371,15 @@ timing and token counts, and a hash of each prompt's first 1,024 characters. It 
 response text.
 
 **Keep private:**
-- `~/.cloudflared/<tunnel-id>.json`, the tunnel's credentials.
-- The proxy (`:18000`), the engine, and the collector's other routes. Never point the tunnel at them.
+- the push token, `~/.config/inference-observe/push-token`;
+- wrangler's login, which `npx wrangler logout` removes once you have deployed.
+
+**Without Workers.** `io-relay` serves the same read-only stream from your machine, for a Cloudflare tunnel. Point
+the tunnel's ingress at it with `path: ^/ws$` and `service: http://127.0.0.1:18240`, and answer everything else
+with `http_status:404`. The Worker keeps your machine free of incoming connections.
 
 PyTorch's distributed store inside SGLang listens on all network interfaces on a random port. Block inbound
-connections with a host firewall, for example `ufw default deny incoming`. The tunnel only makes outbound
-connections, so it keeps working.
+connections with a host firewall, for example `ufw default deny incoming`.
 
 ## Recordings
 
@@ -405,7 +408,8 @@ default 1).
 | Path | |
 |---|---|
 | `taps/` | engine plugins: SGLang (`sglang.srt.plugins`) and vLLM (`vllm.stat_logger_plugins`) |
-| `harness/` | proxy, collector, advisor, agent-session replay, public relay, replay tools, trace converters, expert sampler |
+| `harness/` | proxy, collector, advisor, agent-session replay, public push and relay, replay tools, trace converters, expert sampler |
+| `relay-worker/` | the public relay on Cloudflare (Worker and Durable Object) |
 | `board/` | the board (TypeScript, WebGL2, Vite); `scripts/evaluate.mjs` is its visual test suite |
 | `docs/events.md` | the event format |
 

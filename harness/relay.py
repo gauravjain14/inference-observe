@@ -30,21 +30,17 @@ from .events import InFlight
 QUEUE_FRAMES = 64  # frames a viewer may fall behind before it is disconnected
 
 
-class Relay:
-    def __init__(self, a: argparse.Namespace):
-        self.a = a
-        self.viewers: dict[web.WebSocketResponse, tuple[asyncio.Queue[str], web.Request]] = {}
-        self.per_ip: dict[str, int] = defaultdict(int)
-        # what a viewer joining now needs: the latest of each state event, recent expert routing, notes and
-        # the lifecycle events of requests still in flight
+class StreamState:
+    """What a viewer joining now needs: the latest of each state event, recent expert routing, notes and the
+    lifecycle events of requests still in flight (the same backlog the collector sends a board on connect)."""
+
+    def __init__(self) -> None:
         self.hello: dict[str, Any] | None = None
         self.latest: dict[str, dict[str, Any]] = {}
         self.moe: deque = deque(maxlen=90)
         self.notes: dict[str, dict[str, Any]] = {}
         self.inflight = InFlight()
-        self.stats = {"frames": 0, "bytes": 0, "rejected": 0, "dropped_slow": 0, "closed_for_input": 0}
 
-    # ---- upstream ---------------------------------------------------------------------------
     @staticmethod
     def clean(ev: dict[str, Any]) -> dict[str, Any]:
         if ev.get("type") == "hello" and isinstance(ev.get("replay"), dict) and ev["replay"].get("file"):
@@ -65,6 +61,26 @@ class Relay:
             self.notes[ev["id"]] = ev
         self.inflight.add(ev)
 
+    def backlog(self) -> list[dict[str, Any]]:
+        return list(self.latest.values()) + list(self.moe) + list(self.notes.values()) + self.inflight.backlog()
+
+    def take(self, text: str) -> tuple[list[dict[str, Any]], bool]:
+        """Parse one collector frame, clean and remember its events; returns them and whether it was a batch."""
+        data = json.loads(text)
+        evs = [self.clean(e) for e in (data if isinstance(data, list) else [data]) if isinstance(e, dict)]
+        for e in evs:
+            self.remember(e)
+        return evs, isinstance(data, list)
+
+
+class Relay(StreamState):
+    def __init__(self, a: argparse.Namespace):
+        super().__init__()
+        self.a = a
+        self.viewers: dict[web.WebSocketResponse, tuple[asyncio.Queue[str], web.Request]] = {}
+        self.per_ip: dict[str, int] = defaultdict(int)
+        self.stats = {"frames": 0, "bytes": 0, "rejected": 0, "dropped_slow": 0, "closed_for_input": 0}
+
     async def upstream(self) -> None:
         backoff = 1.0
         while True:
@@ -74,12 +90,9 @@ class Relay:
                     async for msg in ws:
                         if msg.type != WSMsgType.TEXT:
                             continue
-                        data = json.loads(msg.data)
-                        evs = data if isinstance(data, list) else [data]
-                        evs = [self.clean(e) for e in evs if isinstance(e, dict)]
-                        for e in evs:
-                            self.remember(e)
-                        self.fanout(json.dumps(evs if isinstance(data, list) else evs[0], separators=(",", ":")))
+                        evs, batch = self.take(msg.data)
+                        if evs:
+                            self.fanout(json.dumps(evs if batch else evs[0], separators=(",", ":")))
             except Exception:
                 pass
             await asyncio.sleep(backoff)
@@ -101,7 +114,7 @@ class Relay:
         out = []
         if self.hello:
             out.append(json.dumps(self.hello, separators=(",", ":")))
-        rest = list(self.latest.values()) + list(self.moe) + list(self.notes.values()) + self.inflight.backlog()
+        rest = self.backlog()
         if rest:
             out.append(json.dumps(rest, separators=(",", ":")))
         return out

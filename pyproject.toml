@@ -21,6 +21,7 @@ io-mooncake = "harness.mooncake:main"
 io-copilot = "harness.copilot:main"
 io-relay = "harness.relay:main"
 io-check-public = "harness.check_public:main"
+io-push = "harness.push:main"
 
 [build-system]
 requires = ["hatchling"]

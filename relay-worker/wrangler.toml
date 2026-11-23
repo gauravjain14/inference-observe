@@ -1,0 +1,22 @@
+# Copy to wrangler.local.toml (ignored by git), fill in your page origin and domain, then:
+#   npx wrangler secret put INGEST_TOKEN -c wrangler.local.toml
+#   npx wrangler deploy -c wrangler.local.toml
+name = "inference-observe-relay"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+workers_dev = false
+
+[vars]
+ALLOWED_ORIGINS = "https://<user>.github.io"
+MAX_VIEWERS = "200"
+MAX_PER_IP = "4"
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "Relay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Relay"]
+
+# routes = [{ pattern = "live.<domain>", custom_domain = true }]

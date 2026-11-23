@@ -240,7 +240,7 @@ export class Store {
   evictTotal = 0;
   evictSeen = false;
   wallOffsetMs = 0; // >0 while rewound: how far the plate is behind the wall clock
-  private latestMs = 0; // newest event time seen (ms)
+  private clockOffset: number | null = null; // local ms − event ms, at the smallest delay seen
   // per-step batches (engine.step.batch): who was in each scheduler step
   batches: Batch[] = [];
   batchAt = -1e12;
@@ -267,7 +267,7 @@ export class Store {
     if (!m || typeof m !== 'object') return;
     this.events++;
     const tms = typeof m.t_ns === 'number' ? m.t_ns / 1e6 : Date.now();
-    if (tms > this.latestMs) this.latestMs = tms;
+    this.observeClock(now, tms);
     switch (m.type) {
       case 'hello':
         this.hello = { ...(this.hello ?? {}), ...(m as Hello), coverage: { ...(this.hello?.coverage ?? {}), ...((m as Hello).coverage ?? {}) } };
@@ -302,7 +302,7 @@ export class Store {
         return;
       }
       case 'engine.step':
-        this.onStep(m as EngineStep, now);
+        this.onStep(m as EngineStep, now, tms);
         return;
       case 'advisor.note': {
         const n = m as AdvisorNote;
@@ -592,7 +592,8 @@ export class Store {
     return { blocks: 65536, blockSize: 16, tokens: 65536 * 16, known: false };
   }
 
-  private onStep(s: EngineStep, now: number): void {
+  private onStep(s: EngineStep, now: number, tms: number): void {
+    const at = this.evAt(now, tms); // when the step ran: steps can arrive in batches
     this.lastStep = s;
     const bt = (s as unknown as { batch?: { reqs?: [string, string, number][]; truncated?: boolean } }).batch;
     if (bt?.reqs) {
@@ -606,7 +607,7 @@ export class Store {
         } else dReq++;
         this.stepHits.set(rid, (this.stepHits.get(rid) ?? 0) + 1);
       }
-      this.batches.push({ t: now, seq: s.step ?? (s as unknown as { seq?: number }).seq ?? 0, dur: s.iter?.elapsed_ms ?? s.dur_ms ?? null, reqs: bt.reqs, truncated: !!bt.truncated, pTok, pReq, dReq });
+      this.batches.push({ t: at, seq: s.step ?? (s as unknown as { seq?: number }).seq ?? 0, dur: s.iter?.elapsed_ms ?? s.dur_ms ?? null, reqs: bt.reqs, truncated: !!bt.truncated, pTok, pReq, dReq });
       this.batchAt = now;
       while (this.batches.length && now - this.batches[0].t > 12_000) this.batches.shift();
       if (this.batches.length > 5000) this.batches.splice(0, this.batches.length - 5000);
@@ -618,7 +619,7 @@ export class Store {
       this.evictTotal += ev;
     }
     this.stepAt = now;
-    this.stepTimes.push(now);
+    this.stepTimes.push(at);
     this.stepPulses++;
     if (s.preempted) this.preemptPending += Math.min(12, s.preempted);
     for (const f of s.finished ?? []) {
@@ -637,9 +638,18 @@ export class Store {
     return r;
   }
 
-  /** Local time an event happened: events older than the newest one seen (a joining board's backlog) are placed in the past. */
+  /**
+   * Event time → local time. The offset is the smallest delay seen between an event's timestamp and its arrival,
+   * so events that arrive late (a joining board's backlog, a relay's batches) are placed when they happened.
+   */
+  private observeClock(now: number, tms: number): void {
+    const d = now - tms;
+    if (this.clockOffset === null || d < this.clockOffset) this.clockOffset = d;
+    else this.clockOffset += (d - this.clockOffset) * 0.0005; // follow slow clock drift
+  }
+
   private evAt(now: number, tms: number): number {
-    return now - Math.max(0, this.latestMs - tms);
+    return this.clockOffset === null ? now : Math.min(now, tms + this.clockOffset);
   }
 
   private push(arr: Sample[], at: number, v: number): void {

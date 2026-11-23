@@ -47,6 +47,8 @@ async def run(a: argparse.Namespace) -> None:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
         ws = await s.ws_connect(a.feed, headers={"Origin": a.origin})
         first = json.loads((await ws.receive(timeout=15)).data)
+        if isinstance(first, list):  # a relay may send its snapshot as one batch, hello first
+            first = first[0] if first else {}
         check("the page's origin can watch", first.get("type") == "hello", f"{first.get('engine')} {first.get('model')}")
         await ws.close()
         for headers, name in (({"Origin": "https://evil.example"}, "another site"), ({}, "no origin")):

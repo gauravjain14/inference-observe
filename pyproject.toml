@@ -1,6 +1,6 @@
 [project]
 name = "inference-observe"
-version = "0.1.0"
+version = "0.2.0"
 description = "Live flow board and advisor agents for LLM inference engines"
 requires-python = ">=3.12"
 dependencies = [
@@ -18,6 +18,7 @@ io-collector = "harness.collector:main"
 io-advisor = "harness.advisor:main"
 io-replay-ws = "harness.replay_ws:main"
 io-mooncake = "harness.mooncake:main"
+io-copilot = "harness.copilot:main"
 
 [build-system]
 requires = ["hatchling"]

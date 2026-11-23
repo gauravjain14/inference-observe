@@ -29,7 +29,7 @@ from .events import FLOW_VERSION, EventSink, InFlight, now_ns
 
 TICK_HZ = 10
 RATE_WINDOW_S = 2.0
-HIT_WINDOW_S = 10.0
+HIT_WINDOW_S = 60.0  # prefix-cache hit rate: prompts that started prefill in the last minute
 TAP_FRESH_S = 2.0
 
 # Prometheus gauges used when no tap is reporting. Values are summed across label sets
@@ -85,6 +85,8 @@ class Collector:
             "config": {},
             "instances": {},
         }
+        if args.label:
+            self.hello["label"] = args.label
         self.inst_last: dict[str, dict[str, Any]] = {}
         self.inst_t: dict[str, float] = {}
         self.steps: deque[tuple[float, dict[str, Any]]] = deque()
@@ -122,6 +124,9 @@ class Collector:
                         ev = json.loads(msg.data)
                         t = ev.get("type", "")
                         rid = ev.get("rid")
+                        if t == "proxy.hello":
+                            self.close_lost(set(ev.get("inflight") or []))
+                            continue
                         if t == "req.arrive" and rid:
                             self.active.add(rid)
                         elif t in ("req.done", "req.cancel", "req.error") and rid:
@@ -130,6 +135,14 @@ class Collector:
             except (OSError, asyncio.TimeoutError, Exception):
                 self.set_coverage("requests", False)
                 await asyncio.sleep(1.0)
+
+    def close_lost(self, serving: set[str]) -> None:
+        """End requests the proxy is no longer serving (it restarted, or its event stream dropped them)."""
+        for rid in sorted(self.active - serving):
+            self.active.discard(rid)
+            self.publish({"v": FLOW_VERSION, "type": "req.error", "t_ns": now_ns(), "src": "collector", "rid": rid,
+                          "stage": "lost", "status": None,
+                          "detail": "the proxy stopped serving this request without an end event; outcome unknown"})
 
     # ---- tap --------------------------------------------------------------------
     def match_rid(self, engine_request_id: str) -> str | None:
@@ -142,6 +155,7 @@ class Collector:
     def on_tap(self, msg: dict[str, Any]) -> None:
         t = msg.get("type")
         if t in ("tap.hello", "tap.ready"):
+            before = json.dumps(self.hello, sort_keys=True, default=str)
             self.hello["engine_version"] = msg.get("engine_version") or self.hello["engine_version"]
             self.hello["config"].update({k: v for k, v in (msg.get("config") or {}).items() if v is not None})
             if not self.hello["model"]:
@@ -149,7 +163,8 @@ class Collector:
             inst = msg.get("instance", "engine")
             self.hello["instances"][inst] = {"role": inst.split("-")[0], "config": msg.get("config") or {},
                                              "url": msg.get("url")}
-            self.publish({**self.hello, "t_ns": now_ns()})
+            if json.dumps(self.hello, sort_keys=True, default=str) != before:  # taps repeat their hello
+                self.publish({**self.hello, "t_ns": now_ns()})
             return
         if t != "engine.step":
             if t == "moe.tick":
@@ -344,7 +359,14 @@ class Collector:
                 except (json.JSONDecodeError, KeyError):
                     pass
         loop = asyncio.get_running_loop()
-        await loop.create_datagram_endpoint(lambda: TapProtocol(self), local_addr=("127.0.0.1", self.args.tap_port))
+        for attempt in range(30):  # a collector that is still shutting down may hold the port briefly
+            try:
+                await loop.create_datagram_endpoint(lambda: TapProtocol(self), local_addr=("127.0.0.1", self.args.tap_port))
+                break
+            except OSError:
+                if attempt == 29:
+                    raise
+                await asyncio.sleep(0.5)
         self.publish({**self.hello, "t_ns": now_ns()})
         for coro in (self.proxy_loop(), self.metrics_loop(), self.gpu_loop(), self.tick_loop()):
             asyncio.create_task(coro)
@@ -361,6 +383,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=18200)
     ap.add_argument("--tap-port", type=int, default=18201)
     ap.add_argument("--out", type=Path, help="run directory for collector.jsonl")
+    ap.add_argument("--label", help="caption on the board's plate, e.g. the traffic source")
     ap.add_argument("--notes", type=Path, help="notes log shared across runs (loaded at start, appended on post)")
     args = ap.parse_args()
     if args.out:
@@ -372,7 +395,7 @@ def main() -> None:
     app.router.add_get("/ws", c.ws_handler)
     app.router.add_get("/health", c.health)
     app.router.add_post("/note", c.note)
-    web.run_app(app, host=args.host, port=args.port, print=None)
+    web.run_app(app, host=args.host, port=args.port, print=None, shutdown_timeout=2.0)  # boards reconnect
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import time
 import uuid
 from collections import deque
@@ -85,6 +86,9 @@ class Gate:
                 fut.set_result(None)
 
 
+_COMPLETION_TOKENS = re.compile(rb'"completion_tokens":\s*(\d+)')
+
+
 def _prompt_shape(body: dict[str, Any]) -> dict[str, Any]:
     msgs = body.get("messages")
     if isinstance(msgs, list):
@@ -150,6 +154,8 @@ class Proxy:
         self.decode = [u.rstrip("/") for u in decode or []]
         self._rr = {"p": 0, "d": 0}
         self.rid_in_body = False
+        self.open: set[str] = set()  # requests between req.arrive and their end event
+        sink.on_publish = self._track
         # Independent replicas: route each request to the replica with the fewest in flight.
         self.replicas: list[str] = []
         self.replica_inflight: dict[str, int] = {}
@@ -318,6 +324,7 @@ class Proxy:
 
             buf = b""
             n_chunks = 0
+            n_tokens = 0
             pending = 0
             last_emit = time.monotonic_ns()
             usage = None
@@ -325,6 +332,7 @@ class Proxy:
             extras: dict[str, Any] = {}
             first_seen = False
             seen_usage = False
+            stats_sent = False
             try:
                 async for data in up.content.iter_any():
                     await resp.write(data)
@@ -337,20 +345,26 @@ class Proxy:
                                 finish = f or finish
                                 if obj.get("usage"):
                                     usage = obj["usage"]
-                                    if not seen_usage:
+                                    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                                    # the first usage gives the prompt size; some streams (SGLang
+                                    # /v1/completions) add the cached count only in the final usage
+                                    if not seen_usage or (not stats_sent and cached is not None):
                                         seen_usage = True
-                                        details = usage.get("prompt_tokens_details") or {}
+                                        stats_sent = cached is not None
                                         self.sink.emit("req.prefill_stats", rid=rid,
                                                        prompt_tokens=usage.get("prompt_tokens"),
-                                                       cached_tokens=details.get("cached_tokens"),
-                                                       t_ms=(now_ns() - t0) / 1e6)
+                                                       cached_tokens=cached, t_ms=(now_ns() - t0) / 1e6)
                                 for k, v in obj.items():
                                     if k not in STANDARD_CHUNK_KEYS:
                                         extras[k] = v
                         if not sse.has_text(payload):
                             continue
                         n_chunks += 1
-                        pending += 1
+                        # tokens, not chunks: engines that stream usage on every chunk give the running total
+                        ct = _COMPLETION_TOKENS.search(payload)
+                        inc = max(0, int(ct.group(1)) - n_tokens) if ct else 1
+                        n_tokens += inc
+                        pending += inc
                         now = time.monotonic_ns()
                         if not first_seen:
                             first_seen = True
@@ -358,11 +372,11 @@ class Proxy:
                         # Token events are coalesced per request (~10 Hz): per-token events cost more
                         # Python time than the proxy can spare at high token rates.
                         if pending and (n_chunks == 1 or now - last_emit >= CHUNK_FLUSH_NS):
-                            self.sink.emit("req.chunk", rid=rid, i=n_chunks - pending, n=pending)
+                            self.sink.emit("req.chunk", rid=rid, i=n_tokens - pending, n=pending)
                             pending = 0
                             last_emit = now
                 if pending:
-                    self.sink.emit("req.chunk", rid=rid, i=n_chunks - pending, n=pending)
+                    self.sink.emit("req.chunk", rid=rid, i=n_tokens - pending, n=pending)
                 await resp.write_eof()
             except ConnectionResetError:
                 self.sink.emit("req.cancel", rid=rid, stage="streaming", n_chunks=n_chunks)
@@ -408,10 +422,19 @@ class Proxy:
             }
         )
 
+    def _track(self, ev: dict[str, Any]) -> None:
+        rid, t = ev.get("rid"), ev.get("type")
+        if t == "req.arrive" and rid:
+            self.open.add(rid)
+        elif t in ("req.done", "req.cancel", "req.error") and rid:
+            self.open.discard(rid)
+
     async def events(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
         q = self.sink.subscribe()
+        # first message: the requests this proxy is serving now, so a collector can close the ones it lost
+        await ws.send_str(json.dumps({"type": "proxy.hello", "t_ns": now_ns(), "inflight": sorted(self.open)}))
         sender = asyncio.create_task(self._pump(ws, q))
         try:
             async for msg in ws:
@@ -466,7 +489,7 @@ def main() -> None:
     app["proxy"].rid_in_body = args.rid_in_body
     if args.replicas:
         app["proxy"].set_replicas([u for u in args.replicas.split(",") if u])
-    web.run_app(app, host=args.host, port=args.port, print=None)
+    web.run_app(app, host=args.host, port=args.port, print=None, shutdown_timeout=5.0)  # then streams are cut
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 // Click-to-inspect: a pinned, draggable panel describing whatever was clicked, from live data.
 import type { Hit, Scene } from '../scene';
-import { displayRid, trafficClass, type Req, type Store } from '../state';
+import { displayRid, ownerInCell, trafficClass, type KvTokens, type Req, type Store } from '../state';
 import { fmtInt, fmtMs } from '../util';
 import { draggable } from './draggable';
 import { tag, TAG_LEGEND, type Src } from './tags';
@@ -154,6 +154,7 @@ export class Inspector {
     const end = r.tDone ?? this.store.wallNow();
     const rate = r.tFirst != null && end > r.tFirst ? (r.chunks / (end - r.tFirst)) * 1000 : null;
     const b = e ? this.scene.bodies[e.body] : undefined;
+    const o = e ? this.scene.ownerOf(e) : null;
     const fam = r.family ? this.store.families.get(r.family) : undefined;
     const following = this.follow.enabled && this.follow.rid === r.rid;
     const html = `
@@ -164,7 +165,8 @@ export class Inspector {
         ${row('from prefix cache', r.cachedTokens != null ? fmtInt(r.cachedTokens) : '—')}
         ${row('generated', `${fmtInt(r.completionTokens ?? r.chunks)}${r.maxTokens ? ` / ${fmtInt(r.maxTokens)}` : ''}`)}
         ${row('decode rate', rate != null ? `${rate.toFixed(1)} tok/s` : '—')}
-        ${row('KV blocks held', e && e.blocks ? `${fmtInt(e.blocks)}${e.shared ? ` (${fmtInt(e.shared)} in the family core)` : ''}${b ? ` × ${b.cap.blockSize} tok` : ''}` : '—')}
+        ${o ? row('KV held (engine)', `${fmtInt(o.tokens)} tok · ${fmtInt(o.cachedTokens ?? 0)} from cache${o.sharedTokens ? ` · ${fmtInt(o.sharedTokens)} shared with other running requests` : ''}`, 'm')
+          : row('KV blocks held', e && e.blocks ? `${fmtInt(e.blocks)}${e.shared ? ` (${fmtInt(e.shared)} in the shared core)` : ''}${b ? ` × ${b.cap.blockSize} tok` : ''}` : '—')}
         ${row('traffic class', esc(trafficClass(r)))}
         ${row('instance', esc(b?.name ?? r.worker ?? r.decodeWorker ?? '—'))}
         ${row('prefix family', r.family ? `${esc(r.family)} · ${esc(r.prefixOutcome ?? 'no stats yet')}${fam ? ` · ${fam.hits} hits / ${fam.misses} misses` : ''}` : '—')}
@@ -181,6 +183,7 @@ export class Inspector {
     const inst = this.store.instances(now).find((i) => i.name === name);
     const usage = inst?.kv_usage ?? this.store.engine?.kv_usage ?? null;
     const km = this.scene.mapFor(bi);
+    if (km?.tokens && km.capacityTokens) return this.kvBody2(name, km.tokens, km.capacityTokens, bi, now);
     const fromMap = !!(km && km.usedTokens != null && km.capacityTokens);
     const tokPerBlock = cap.blockSize || 1;
     const used = fromMap ? Math.min(km!.usedTokens!, km!.ownedTokens ?? 0) / tokPerBlock : usage != null ? usage * cap.blocks : null;
@@ -211,10 +214,53 @@ export class Inspector {
     return [`KV cache · <b>${esc(name)}</b>`, html];
   }
 
+  /** KV body from kv.map format 2: every slot classified, each once. */
+  private kvBody2(name: string, t: KvTokens, cap: number, bi: number, now: number): [string, string] {
+    const tok = (n: number) => `${fmtInt(n)} tok · ${pct(n / cap)}`;
+    const cores = [...this.scene.famCores.values()].filter((f) => f.body === bi).sort((a, c) => c.tokens - a.tokens).slice(0, 5);
+    const pl = this.store.prefixLive(now);
+    const hist = (this.store.hist.inst.get(name) ?? []).length > 1 ? this.store.hist.inst.get(name)!.map((x) => x.kv) : this.store.hist.kv.map((x) => x.v);
+    const html = `
+      <table>
+        ${row('capacity', `${fmtInt(cap)} tok`, 'm')}
+        ${row('own (running requests)', tok(t.own), 'm')}
+        ${row('reused from the cache', tok(t.reused), 'm')}
+        ${row('shared by 2+ running', tok(t.shared), 'm')}
+        ${row('cached, no running owner', tok(t.cached), 'm')}
+        ${row('free', tok(t.free), 'm')}
+        ${row('source', 'engine KV tables (kv.map), every slot once', 'm')}
+        ${row('prefix cache (live)', pl.tokenRate != null ? `${pct(pl.tokenRate, 0)} of prompt tok · ${pl.hits} hit / ${pl.misses} miss` : this.store.engine?.prefix_hit_rate != null ? `${pct(this.store.engine.prefix_hit_rate, 0)} (engine)` : '—')}
+        ${row('KV read by decode', `${fmtK(this.scene.kvRead)} tok/s`)}
+      </table>
+      ${spark(hist, 'KV in use', (v) => pct(v))}
+      <h4>Shared now</h4>
+      ${cores.length ? `<table>${cores.map((f) => row(esc(f.id.replace(/^g:/, '').replace(/~[0-9a-z]+$/i, '')), `${fmtInt(f.tokens)} tok · held by ${f.members} running requests`, f.measured ? 'm' : 'e')).join('')}</table>` : '<p class="dim">No running requests share KV slots right now.</p>'}`;
+    return [`KV cache · <b>${esc(name)}</b>`, html];
+  }
+
   private cell(id: string): [string, string] {
     const [bi, bin] = id.split(':').map(Number);
     const m = this.scene.mapFor(bi);
     if (!m) return ['KV cell', '<p class="dim">The memory map is not reported yet.</p>'];
+    if (m.levels) {
+      const L = m.levels;
+      const n = (lv: Uint8Array) => Math.round((lv[bin] / 255) * m.binTokens);
+      const holders = m.owners.filter((o) => ownerInCell(o, bin));
+      const html = `<table>
+        ${row('own', `≈${fmtInt(n(L.own))} tok`, 'd')}
+        ${row('reused from the cache', `≈${fmtInt(n(L.reused))} tok`, 'd')}
+        ${row('shared by 2+ running', `≈${fmtInt(n(L.shared))} tok`, 'd')}
+        ${row('cached, no running owner', `≈${fmtInt(n(L.cached))} tok`, 'd')}
+        ${row('free', `≈${fmtInt(n(L.free))} tok`, 'd')}
+        ${row('cell', `${fmtInt(bin)} of ${fmtInt(m.bins)} · ${fmtInt(m.binTokens)} tokens`, 'm')}
+      </table>
+      ${holders.length ? `<h4>Running requests with tokens here</h4><table>${holders.map((o) => {
+        const r = this.store.reqs.get(o.rid);
+        return row(esc(displayRid(o.rid)), `${fmtInt(o.tokens)} tok · ${fmtInt(o.cachedTokens ?? 0)} from cache${o.sharedTokens ? ` · ${fmtInt(o.sharedTokens)} shared` : ''}${r ? ` · ${esc(trafficClass(r))}` : ''}`, 'm');
+      }).join('')}</table>` : ''}
+      <p class="dim">Token counts per cell are rounded to 1/255 of the cell. Pages are scattered: a request's tokens can sit in many cells.</p>`;
+      return [`KV cell <b>#${bin}</b>`, html];
+    }
     const st = m.state[bin];
     const ownersIdx = st >= 0 ? [st] : st === -3 || st === -4 ? (m.shared.get(bin) ?? []) : [];
     const state =
@@ -244,17 +290,16 @@ export class Inspector {
 
   private core(id: string): [string, string] {
     const f = this.scene.famCores.get(id);
-    const st = this.store.families.get(id);
-    const members = [...this.scene.ents.values()].filter((e) => e.req.family === id && e.req.phase !== 'done').length;
+    if (!f) return ['Shared prefix', '<p class="dim">No longer shared: fewer than two running requests hold it.</p>'];
+    const members = [...this.scene.ents.values()].filter((e) => e.coreId === id);
     const html = `<table>
-      ${row('members seen', fmtInt(st?.members ?? 0))}
-      ${row('running now', fmtInt(members))}
-      ${row('hits / misses', `${st?.hits ?? 0} / ${st?.misses ?? 0}`)}
-      ${row('shared prefix', st ? `≈${fmtInt(st.coreTokens)} tokens` : '—')}
-      ${row('core blocks', f ? fmtInt(f.blocks) : '—')}
+      ${row('shared tokens', `${fmtInt(f.tokens)} (held once in memory)`, f.measured ? 'm' : 'e')}
+      ${row('held by', `${members.length} running requests`, f.measured ? 'm' : 'e')}
+      ${row('source', f.measured ? 'engine KV tables: the same slots in each request' : 'estimate: same prompt start, each reused cached tokens', f.measured ? 'm' : 'e')}
     </table>
-    <p class="dim">Members that reuse the prefix attach around this core; a miss rebuilds its own copy.</p>`;
-    return [`Prefix family · <b>${esc(id)}</b>`, html];
+    <table>${members.map((e) => row(esc(displayRid(e.req.rid)), esc(trafficClass(e.req)))).join('')}</table>
+    <p class="dim">The core is drawn once; each member's colony holds only its own tokens.</p>`;
+    return [`Shared prefix · <b>${esc(id.replace(/^g:/, '').replace(/~[0-9a-z]+$/i, ''))}</b>`, html];
   }
 
   // ---- experts -------------------------------------------------------------------------------

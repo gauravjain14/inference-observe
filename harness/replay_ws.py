@@ -86,8 +86,8 @@ class Replayer:
     def mark(self, ev: dict[str, Any]) -> dict[str, Any]:
         if ev.get("type") == "hello":
             rec = time.strftime("%Y-%m-%d %H:%M", time.gmtime((ev.get("t_ns") or 0) / 1e9))
-            ev = {**ev, "label": "Recorded specimen", "replay": {"file": str(self.path), "speed": self.a.speed,
-                                                                  "recorded_utc": rec}}
+            ev = {**ev, "label": self.a.label or ev.get("label") or "Recorded specimen",
+                  "replay": {"file": str(self.path), "speed": self.a.speed, "recorded_utc": rec}}
             self.hello = ev
         elif ev.get("type") in ("engine.tick", "gpu.tick", "kv.map", "moe.tick"):
             self.last[ev["type"]] = ev
@@ -214,6 +214,7 @@ def main() -> None:
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--start", type=float, default=0.0, help="seconds after the first engine step")
     ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--label", default=None, help="caption on the board's plate (default: the recording's own)")
     ap.add_argument("--notes", type=Path, default=None, help="notes.jsonl for the ledger and Field notes")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18200)

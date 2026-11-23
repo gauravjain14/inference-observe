@@ -2,7 +2,7 @@
 // slime-mold veins, GPUs as sap-green neurons. Every moving mark is driven by an event
 // or a measured value from the Store; ambient drift is only the medium.
 import { Dots } from './gl/renderer';
-import { trafficClass, type Instance, type KvCapacity, type KvMap, type Req, type Store } from './state';
+import { classLabel, ownerInCell, trafficClass, type Instance, type KvCapacity, type KvMap, type KvOwner, type Req, type Store } from './state';
 import { INK, clamp, classInk, gauss, h1, hashStr, lerp, mixInk, mulberry32, smooth, type Ink } from './util';
 
 export interface Hit {
@@ -156,7 +156,6 @@ interface Junction {
 }
 
 const CLASS_ORDER = ['chat', 'agentic', 'rag', 'burst', 'spec', 'short', 'medium', 'long'];
-const CLASS_LABEL: Record<string, string> = { short: 'short prompts', medium: 'medium prompts', long: 'long prompts', unclassified: 'joined mid-flight' };
 
 interface Spark {
   rid: string;
@@ -211,6 +210,9 @@ interface FamCore {
   y: number;
   body: number;
   blocks: number;
+  tokens: number; // shared tokens, each once
+  members: number; // running requests that hold them now
+  measured: boolean; // from the engine's KV map (slot-exact); otherwise estimated from cached-token counts
   seed: number;
   spin: number; // next attachment angle
   lastActive: number;
@@ -272,7 +274,8 @@ class Entity {
   dots = 0;
   innerDots = 0; // cached prefix (or a missed duplicate core)
   promptDots = 0;
-  shared = 0; // blocks held by the family core instead
+  shared = 0; // blocks held by its shared core instead
+  coreId: string | null = null; // the shared core it reads, when two or more running requests hold the same slots
   oldBlocks = 0;
   oldBody = 0;
   cachedOut = false;
@@ -317,6 +320,9 @@ export class Scene {
   follow: string | null = null; // request being narrated
   highlight: { rids: Set<string>; until: number } | null = null; // requests of a clicked scheduler step
   famCores = new Map<string, FamCore>();
+  private ownerIdx = new WeakMap<KvMap, Map<string, KvOwner>>();
+  private discs: [number, number, number, number][] = [];
+  private cent: { m: KvMap; g: CellGeo; map: Map<string, [number, number]> } | null = null; // x, y, r, seed of the colony (-1 for a core)
   cachedCol: Colony[] = [];
   flecks: { x: number; y: number; vx: number; vy: number; t: number }[] = [];
   kvRead = 0; // KV tokens read per second by decode steps (Σ context × steps/s)
@@ -859,7 +865,7 @@ export class Scene {
     e.body = Math.max(0, Math.min(bi, this.bodies.length - 1));
     e.patch = true;
     this.sizeColony(e);
-    const [x, y] = this.attachPoint(e) ?? this.freeSpot(e, b);
+    const [x, y] = this.freeSpot(e, b); // shared-core members move next to their core once the group is known
     e.tx = x;
     e.ty = y;
     e.px = x;
@@ -896,70 +902,103 @@ export class Scene {
     return best;
   }
 
-  /** Family members that reuse the shared prefix attach around its one core. */
-  private attachPoint(e: Entity): [number, number] | null {
-    const r = e.req;
-    if (!r.family || !(r.prefixOutcome === 'hit' || r.prefixOutcome === 'partial')) return null;
-    const f = this.famCores.get(r.family);
-    if (!f || f.body !== e.body) return null;
+  /** Members of a shared core attach around it. */
+  private attachPoint(e: Entity, f: FamCore): [number, number] {
     f.spin += 2.399963;
     const d = this.blockR(f.body, f.blocks) + e.pr + 2;
     return [f.x + Math.cos(f.spin) * d, f.y + Math.sin(f.spin) * d];
   }
 
-  /** Colony size = the request's KV blocks: ceil(tokens / block size), growing during decode. */
+  /** The engine's KV-map entry for a running request (kv.map format 2), if its body has one. */
+  ownerOf(e: Entity): KvOwner | null {
+    const m = this.mapFor(e.body);
+    if (!m || m.format !== 2) return null;
+    let idx = this.ownerIdx.get(m);
+    if (!idx) {
+      idx = new Map(m.owners.map((o) => [o.rid, o]));
+      this.ownerIdx.set(m, idx);
+    }
+    return idx.get(e.req.rid) ?? null;
+  }
+
+  /**
+   * Colony size = the request's KV, to scale: ceil(tokens / block size), growing during decode.
+   * From the centre out: the prefix it found in the cache (dark), the prompt it computed, then generated tokens.
+   * Tokens it shares with other running requests are drawn once, in their shared core, and left out here.
+   */
   private sizeColony(e: Entity): void {
     const b = this.bodies[e.body];
     if (!b) return;
     const r = e.req;
     const bs = b.cap.blockSize;
     const prompt = promptTokens(r);
-    e.blocks = Math.ceil((prompt + r.chunks) / bs);
-    const cachedBlocks = r.cachedTokens ? Math.min(e.blocks, Math.floor(r.cachedTokens / bs)) : 0;
-    const core = r.family ? this.famCores.get(r.family) : undefined;
-    const attached = !!core && core.body === e.body && (r.prefixOutcome === 'hit' || r.prefixOutcome === 'partial');
-    e.shared = attached ? cachedBlocks : 0;
+    const o = this.ownerOf(e);
+    const core = e.coreId ? this.famCores.get(e.coreId) : undefined;
+    const tokens = o ? o.tokens : prompt + r.chunks;
+    const cached = Math.min(tokens, o?.cachedTokens ?? r.cachedTokens ?? 0);
+    const shared = core ? Math.min(cached || tokens, o ? (o.sharedTokens ?? 0) : core.tokens) : 0;
+    e.blocks = Math.ceil(tokens / bs);
+    e.shared = Math.floor(shared / bs);
     const own = Math.max(1, e.blocks - e.shared);
     e.dots = Math.max(1, Math.round(own * b.dpb));
-    // inner blocks: a cached prefix not held by a core, or the duplicate core a miss had to rebuild
-    const famCore = core ? Math.round(core.blocks * b.dpb) : 0;
-    e.innerDots = attached ? 0 : r.prefixOutcome === 'miss' ? Math.min(e.dots, famCore) : Math.round(cachedBlocks * b.dpb);
-    e.promptDots = Math.min(e.dots, Math.round((Math.ceil(prompt / bs) - e.shared) * b.dpb));
+    e.innerDots = Math.min(e.dots, Math.round((Math.max(0, cached - shared) / bs) * b.dpb));
+    e.promptDots = clamp(Math.round((Math.max(0, prompt - shared) / bs) * b.dpb), e.innerDots, e.dots);
     e.pr = b.sp * Math.sqrt(e.dots) + 1;
   }
 
   /** Family cores, cached tissue, flashes, evictions and the KV read rate. */
   private updateKv(dt: number, now: number): void {
     const s = this.store;
-    // family cores appear once the engine reports a member reusing the shared prefix
+    // shared cores: two or more running requests that hold the same prefix right now. With the engine's
+    // KV map (format 2) the groups and sizes are slot-exact; without it, requests of one prefix family that
+    // each reused cached tokens are grouped, sized by the smallest reuse (an estimate).
+    const want = new Map<string, { members: Entity[]; tokens: number; body: number; measured: boolean }>();
     for (const e of this.ents.values()) {
+      e.coreId = null;
       const r = e.req;
-      if (!r.family || !e.patch || e.body < 0) continue;
-      const fam = s.families.get(r.family);
-      if (!fam) continue;
-      let core = this.famCores.get(r.family);
-      const b = this.bodies[e.body];
-      if (!core && b && b.role !== 'prefill' && (fam.hits > 0 || (fam.members >= 2 && r.prefixOutcome === 'hit'))) {
-        core = {
-          id: r.family, x: e.tx, y: e.ty, body: e.body, blocks: Math.max(1, Math.ceil(fam.coreTokens / b.cap.blockSize)),
-          seed: hashStr(r.family), spin: 0, lastActive: this.t,
-        };
-        this.famCores.set(r.family, core);
+      if (!e.patch || e.body < 0 || e.cachedOut || r.phase === 'done' || r.phase === 'failed') continue;
+      if (this.bodies[e.body]?.role === 'prefill') continue;
+      const o = this.ownerOf(e);
+      let key: string | null = null;
+      let tokens = 0;
+      let measured = false;
+      if (o) {
+        if (o.group && (o.sharedTokens ?? 0) > 0) [key, tokens, measured] = [`g:${o.group}`, o.groupTokens, true];
+      } else if (!this.mapFor(e.body) || this.mapFor(e.body)!.format !== 2) {
+        if (r.family && (r.cachedTokens ?? 0) > 0 && (r.prefixOutcome === 'hit' || r.prefixOutcome === 'partial')) {
+          [key, tokens] = [r.family, r.cachedTokens!];
+        }
       }
-      if (core) {
-        const b2 = this.bodies[core.body];
-        if (b2) core.blocks = Math.max(core.blocks, Math.ceil(fam.coreTokens / b2.cap.blockSize));
-        if (r.phase !== 'done' && r.phase !== 'failed') core.lastActive = this.t;
-        // members (re)attach when their outcome lands
-        const want = this.attachPointPeek(e, core);
-        if (want && !e.cachedOut && (r.prefixOutcome === 'hit' || r.prefixOutcome === 'partial') && Math.hypot(e.tx - core.x, e.ty - core.y) > this.blockR(core.body, core.blocks) + e.pr + 8) {
-          const p = this.attachPoint(e);
-          if (p) [e.tx, e.ty] = p;
+      if (!key) continue;
+      const w = want.get(key) ?? { members: [], tokens, body: e.body, measured };
+      w.members.push(e);
+      w.tokens = measured ? Math.max(w.tokens, tokens) : Math.min(w.tokens, tokens);
+      want.set(key, w);
+    }
+    for (const [id, w] of want) {
+      if (w.members.length < 2) continue;
+      const b = this.bodies[w.body];
+      if (!b) continue;
+      let core = this.famCores.get(id);
+      const blocks = Math.max(1, Math.ceil(w.tokens / b.cap.blockSize));
+      if (!core) {
+        const first = w.members[0];
+        core = { id, x: first.tx, y: first.ty, body: w.body, blocks, tokens: w.tokens, members: 0, measured: w.measured,
+          seed: hashStr(id), spin: 0, lastActive: this.t };
+        this.famCores.set(id, core);
+      }
+      Object.assign(core, { blocks, tokens: w.tokens, members: w.members.length, measured: w.measured, lastActive: this.t });
+      for (const e of w.members) {
+        e.coreId = id;
+        // members sit around their one core
+        if (Math.hypot(e.tx - core.x, e.ty - core.y) > this.blockR(core.body, core.blocks) + e.pr + 8) {
+          const p = this.attachPoint(e, core);
+          [e.tx, e.ty] = p;
         }
       }
     }
     for (const [id, core] of this.famCores) {
-      // a core grows as the engine reports more shared tokens: keep it whole inside its body (drift, no jump)
+      // a core grows as more tokens are shared: keep it whole inside its body (drift, no jump)
       const bb = this.bodies[core.body];
       if (bb) {
         const R = this.blockR(core.body, core.blocks);
@@ -974,9 +1013,10 @@ export class Scene {
           core.y += (bb.cy + ny * f * bb.ry - core.y) * k;
         }
       }
-      if (this.t - core.lastActive > 2) {
-        // no live member: the shared prefix lingers as reusable cache, then erodes
-        this.cachedCol.push({ x: core.x, y: core.y, blocks: core.blocks, seed: core.seed, born: this.t, life: 30, body: core.body });
+      if (core.lastActive < this.t) {
+        // fewer than two running holders: the prefix is cached, not shared. With the engine's map the
+        // cached share is drawn from the map; without it, it lingers here as estimated reusable tissue.
+        if (!core.measured) this.cachedCol.push({ x: core.x, y: core.y, blocks: core.blocks, seed: core.seed, born: this.t, life: 30, body: core.body });
         this.famCores.delete(id);
       }
     }
@@ -1013,10 +1053,6 @@ export class Scene {
       read += (promptTokens(e.req) + e.req.chunks) * (sps ?? 0);
     }
     this.kvRead = lerp(this.kvRead, read, 1 - Math.exp(-dt * 2));
-  }
-
-  private attachPointPeek(e: Entity, core: FamCore): boolean {
-    return !!e.req.family && core.body === e.body;
   }
 
   private ensureTrunk(name: string): Junction {
@@ -1108,7 +1144,15 @@ export class Scene {
         e.route.segs = [];
         continue;
       }
-      const [ox, oy] = (this.memMap && this.mapCentroid.get(e.req.rid)) || [e.px, e.py];
+      let [ox, oy] = (this.memMap && this.mapCentroid.get(e.req.rid)) || [e.px, e.py];
+      if (!this.memMap) {
+        // a vein leaves its own colony at the rim facing its branch
+        const dx = b.x - ox;
+        const dy = b.y - oy;
+        const dd = Math.hypot(dx, dy) || 1;
+        ox += (dx / dd) * (e.pr + 1.5);
+        oy += (dy / dd) * (e.pr + 1.5);
+      }
       const key = `${b.x.toFixed(0)},${b.y.toFixed(0)},${ox.toFixed(0)},${oy.toFixed(0)}`;
       if (key !== e.twigKey || !e.capillary) {
         e.capillary = polyFrom(bezierPts(ox, oy, b.x, b.y, (h1(e.seed) - 0.5) * 0.45, 14));
@@ -1149,6 +1193,12 @@ export class Scene {
     const s = this.store;
     const cov = s.coverage(now);
     d.reset();
+    // colonies and cores that veins and sparks pass beneath (colony view)
+    this.discs.length = 0;
+    if (!this.memMap) {
+      for (const e of this.ents.values()) if (e.patch && e.dissolve > 0.5 && e.fade < 0.6) this.discs.push([e.px, e.py, e.pr + 1, e.seed]);
+      for (const f of this.famCores.values()) this.discs.push([f.x, f.y, this.blockR(f.body, f.blocks) + 3, -1]);
+    }
     this.drawBodies(d, cov.kv, now);
     this.drawTransfers(d);
     this.drawMembrane(d);
@@ -1273,6 +1323,7 @@ export class Scene {
     const e = this.follow ? this.ents.get(this.follow) : undefined;
     if (!e) return;
     const cellVisible = e.dissolve < 0.6 || !e.patch;
+    if (this.memMap && !cellVisible && this.mapFor(e.body)?.levels) return; // the map marks its cells instead
     const cx = cellVisible ? e.x : e.px;
     const cy = cellVisible ? e.y : e.py;
     const R = (cellVisible ? e.r * e.qs : e.pr) + 8;
@@ -1590,7 +1641,18 @@ export class Scene {
       const u = (h1(e.seed + k * 13) * p.len + flow) % p.len;
       at(p, u, TMP);
       const lat = (h1(e.seed + k * 29) - 0.5) * 2 * width * 0.7;
-      d.add(TMP.x + TMP.nx * lat, TMP.y + TMP.ny * lat, 1.2 + h1(e.seed + k) * 0.6, INK.crimson, (0.28 + 0.6 * busy) * (1 - e.fade) * dim);
+      const x = TMP.x + TMP.nx * lat;
+      const y = TMP.y + TMP.ny * lat;
+      if (this.underOther(x, y, e.seed)) continue; // the vein passes beneath other colonies
+      d.add(x, y, 1.2 + h1(e.seed + k) * 0.6, INK.crimson, (0.28 + 0.6 * busy) * (1 - e.fade) * dim);
+    }
+    if (!this.memMap) {
+      // root: where the vein leaves its own colony
+      at(p, 0, TMP);
+      for (let k = 0; k < 5; k++) {
+        const a = (k / 5) * Math.PI * 2 + e.seed;
+        d.add(TMP.x + Math.cos(a) * 1.6, TMP.y + Math.sin(a) * 1.6, 1.6, INK.crimsonDeep, 0.85 * (1 - e.fade) * dim);
+      }
     }
   }
 
@@ -1692,6 +1754,12 @@ export class Scene {
     }
   }
 
+  /** Whether a point lies under a colony or core other than the one with this seed. */
+  private underOther(x: number, y: number, seed: number): boolean {
+    for (const [cx, cy, r, sd] of this.discs) if (sd !== seed && (x - cx) ** 2 + (y - cy) ** 2 < r * r) return true;
+    return false;
+  }
+
   private drawSparks(d: Dots): void {
     const fr = this.follow ? this.ents.get(this.follow)?.route : undefined;
     for (const s of this.sparks) {
@@ -1701,6 +1769,7 @@ export class Scene {
       const dim = this.follow && s.route !== fr ? 0.4 : 1;
       const end = clamp((len + 20 - s.s) / 40, 0, 1) * dim;
       atRoute(s.route, s.s, TMP);
+      if (this.underOther(TMP.x, TMP.y, this.ents.get(s.rid)?.seed ?? -2)) continue; // passing beneath another colony
       d.add(TMP.x, TMP.y, s.size, s.ink, 0.92 * end);
       atRoute(s.route, s.s - 4, TMP);
       d.add(TMP.x, TMP.y, s.size * 0.75, s.ink, 0.62 * end);
@@ -1803,7 +1872,7 @@ export class Scene {
     const out: { id: string; kind: 'branch' | 'trunk'; x: number; y: number; name: string; flux: number; multi: boolean }[] = [];
     for (const b of this.branches.values()) {
       if (b.flux < 0.5 && b.target === 0) continue;
-      out.push({ id: b.key, kind: 'branch', x: b.x, y: b.y, name: CLASS_LABEL[b.name] ?? b.name, flux: b.flux, multi });
+      out.push({ id: b.key, kind: 'branch', x: b.x, y: b.y, name: classLabel(b.name), flux: b.flux, multi });
     }
     for (const t of this.trunks.values()) out.push({ id: `trunk:${t.key}`, kind: 'trunk', x: t.x, y: t.y, name: t.name, flux: t.flux, multi });
     return out;
@@ -1843,6 +1912,12 @@ export class Scene {
   kvShares(bi: number): { live: number; cached: number; free: number } | null {
     const m = this.mapFor(bi);
     if (!m) return null;
+    if (m.tokens && m.capacityTokens) {
+      // format 2: every slot classified by the engine's own tables, each slot once
+      const t = m.tokens;
+      const cap = m.capacityTokens;
+      return { live: (t.own + t.reused + t.shared) / cap, cached: t.cached / cap, free: t.free / cap };
+    }
     const usage = this.bodies.length === 1 ? this.store.engine?.kv_usage : undefined;
     if (m.capacityTokens && m.usedTokens != null && usage != null) {
       const used = clamp(m.usedTokens / m.capacityTokens, 0, 1);
@@ -1865,30 +1940,37 @@ export class Scene {
   }
 
   /** Large shared prefixes on the plate (colony view): where they are, how big, how many requests reuse them. */
-  familyLabels(): { id: string; x: number; y: number; tokens: number; members: number }[] {
+  familyLabels(): { id: string; x: number; y: number; tokens: number; members: number; measured: boolean }[] {
     // one label (the largest shared prefix), single-engine plates only: several would crowd the body labels
     if (this.memMap || this.bodies.length > 1) return [];
-    const out: { id: string; x: number; y: number; tokens: number; members: number }[] = [];
+    const out: { id: string; x: number; y: number; tokens: number; members: number; measured: boolean }[] = [];
     for (const f of this.famCores.values()) {
-      const b = this.bodies[f.body];
-      if (!b) continue;
-      let members = 0;
-      for (const e of this.ents.values()) if (e.req.family === f.id && e.req.phase !== 'done') members++;
-      const tokens = f.blocks * (this.store.kvCapacity(b.name).blockSize || 1);
-      if (members < 2 || tokens < 1000) continue;
-      out.push({ id: f.id, x: f.x, y: f.y + this.blockR(f.body, f.blocks) + 10, tokens, members });
+      if (!this.bodies[f.body] || f.members < 2 || f.tokens < 1000) continue;
+      out.push({ id: f.id, x: f.x, y: f.y + this.blockR(f.body, f.blocks) + 10, tokens: f.tokens, members: f.members, measured: f.measured });
     }
     return out.sort((a, b) => b.tokens - a.tokens).slice(0, 1);
   }
 
   /** Memory-map view: where the shared-prefix cells sit (left of the body, at their mean height) and how many tokens. */
-  mapSharedLabel(): { x: number; y: number; share: number } | null {
+  mapSharedLabel(): { x: number; y: number; share: number; tokens: boolean } | null {
     if (!this.memMap) return null;
     const m = this.mapFor(0);
     const b = this.bodies[0];
     if (!m || !b) return null;
     const g = this.cellGeo(0, m.bins);
     if (!g) return null;
+    if (m.levels && m.tokens && m.capacityTokens) {
+      // format 2: the share of tokens held by two or more running requests, placed at those cells' mean height
+      const share = m.tokens.shared / m.capacityTokens;
+      if (share < 0.01) return null;
+      let w = 0;
+      let sy = 0;
+      for (let i = 0; i < m.bins && i < g.y.length; i++) {
+        w += m.levels.shared[i];
+        sy += m.levels.shared[i] * g.y[i];
+      }
+      return w ? { x: b.cx - b.rx - 14, y: sy / w, share, tokens: true } : null;
+    }
     let n = 0;
     let sy = 0;
     for (let i = 0; i < m.bins && i < g.y.length; i++) {
@@ -1898,7 +1980,7 @@ export class Scene {
       }
     }
     if (n < m.bins * 0.03) return null;
-    return { x: b.cx - b.rx - 14, y: sy / n, share: n / m.bins };
+    return { x: b.cx - b.rx - 14, y: sy / n, share: n / m.bins, tokens: false };
   }
 
   /** kv.map for a body (single-body plates accept the only map there is). */
@@ -1948,7 +2030,12 @@ export class Scene {
 
   /** The KV pool as the engine lays it out: one cell per bin. */
   private drawMemMap(d: Dots, bi: number, now: number): void {
-    const m = this.mapFor(bi);
+    const m0 = this.mapFor(bi);
+    if (m0?.levels) {
+      this.drawMemMap2(d, bi, m0, now);
+      return;
+    }
+    const m = m0;
     const g = this.cellGeo(bi, m?.bins ?? 4096);
     if (!g) return;
     const v = this.view;
@@ -2001,6 +2088,75 @@ export class Scene {
       }
     }
     if (m) for (const [k, [sx, sy, n]] of sums) this.mapCentroid.set(m.owners[k].rid, [sx / n, sy / n]);
+  }
+
+  /**
+   * kv.map format 2: each cell is split into sub-squares in proportion to its tokens by kind: shared (deepest),
+   * reused from the cache (deep), own (ultramarine), cached for reuse (pale, hatched), free (bare paper).
+   * Cells the followed request has tokens in carry a crimson dot.
+   */
+  private drawMemMap2(d: Dots, bi: number, m: KvMap, now: number): void {
+    const g = this.cellGeo(bi, m.bins);
+    const L = m.levels;
+    if (!g || !L) return;
+    const v = this.view;
+    const zc = Math.pow(this.zoom, 0.45);
+    const n = this.zoom > 2.5 ? 3 : 2; // n × n sub-squares per cell
+    const sub = (g.c / n) * 0.9 * zc;
+    const kinds: [Uint8Array, Ink, number][] = [
+      [L.shared, INK.ultraDeep, 0.97], [L.reused, [30, 44, 120], 0.95], [L.own, INK.ultra, 0.9], [L.cached, [176, 188, 226], 0.85],
+    ];
+    const cachedInk: Ink = [104, 124, 196];
+    const fol = this.follow ? m.owners.find((o) => o.rid === this.follow) : undefined;
+    const slots = n * n;
+    const take = new Int32Array(5);
+    if (this.cent?.m !== m || this.cent.g !== g) {
+      // where each request's tokens sit on average (veins leave from there in this view); once per map
+      const map = new Map<string, [number, number]>();
+      for (const o of m.owners) {
+        let sx = 0;
+        let sy = 0;
+        let k = 0;
+        for (let i = 0; i < g.x.length && i < m.bins; i++) {
+          if (!ownerInCell(o, i)) continue;
+          sx += g.x[i];
+          sy += g.y[i];
+          k++;
+        }
+        if (k) map.set(o.rid, [sx / k, sy / k]);
+      }
+      this.cent = { m, g, map };
+    }
+    for (const [rid, c] of this.cent.map) this.mapCentroid.set(rid, c);
+    for (let i = 0; i < g.x.length && i < m.bins; i++) {
+      const x = g.x[i];
+      const y = g.y[i];
+      if (x < v.x0 - 4 || x > v.x1 + 4 || y < v.y0 - 4 || y > v.y1 + 4) continue;
+      const appear = clamp((now - m.changedAt[i]) / 600, 0, 1) * 0.85 + 0.15;
+      // largest-remainder split of the n² sub-squares over the five kinds (free stays bare paper)
+      const lv = [kinds[0][0][i], kinds[1][0][i], kinds[2][0][i], kinds[3][0][i], L.free[i]];
+      const tot = lv[0] + lv[1] + lv[2] + lv[3] + lv[4] || 1;
+      let used = 0;
+      const rem: [number, number][] = [];
+      for (let k = 0; k < 5; k++) {
+        const exact = (lv[k] / tot) * slots;
+        take[k] = Math.floor(exact);
+        used += take[k];
+        rem.push([exact - take[k], k]);
+      }
+      rem.sort((a2, b2) => b2[0] - a2[0]);
+      for (let r = 0; used < slots && r < 5; r++, used++) take[rem[r][1]]++;
+      let q = 0;
+      for (let k = 0; k < 4; k++) {
+        for (let t = 0; t < take[k] && q < slots; t++, q++) {
+          const sx = x + ((q % n) - (n - 1) / 2) * (g.c / n);
+          const sy = y + (Math.floor(q / n) - (n - 1) / 2) * (g.c / n);
+          d.addSquare(sx, sy, sub, kinds[k][1], kinds[k][2] * appear);
+          if (k === 3) d.add(sx, sy, sub * 0.35, cachedInk, 0.8 * appear); // hatch mark: kept for reuse
+        }
+      }
+      if (fol && ownerInCell(fol, i)) d.add(x, y, Math.max(2.4, g.c * 0.5 * zc), INK.crimson, 0.95);
+    }
   }
 
   /** Which memory-map cell is under a world point. */

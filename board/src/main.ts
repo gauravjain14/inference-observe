@@ -12,7 +12,7 @@ import { Scene } from './scene';
 import { MockSource } from './sources/mock';
 import { ReplaySource } from './sources/replay';
 import { WsSource } from './sources/ws';
-import { Store } from './state';
+import { ownerInCell, Store } from './state';
 import { BatchStrip } from './ui/batchstrip';
 import { Fig2 } from './ui/fig2';
 import { Fig4 } from './ui/fig4';
@@ -162,9 +162,14 @@ canvas.addEventListener('pointermove', (ev) => {
       // memory map: the tooltip shows the cell's owner request
       const [bi, bin] = hit.id.split(':').map(Number);
       const m = scene.mapFor(bi);
-      const st = m?.state[bin] ?? -1;
-      const k = st >= 0 ? st : st === -3 || st === -4 ? (m?.shared.get(bin)?.[0] ?? -1) : -1;
-      req = k >= 0 && m ? (store.reqs.get(m.owners[k].rid) ?? null) : null;
+      if (m?.levels) {
+        const o = m.owners.find((ow) => ownerInCell(ow, bin));
+        req = o ? (store.reqs.get(o.rid) ?? null) : null;
+      } else {
+        const st = m?.state[bin] ?? -1;
+        const k = st >= 0 ? st : st === -3 || st === -4 ? (m?.shared.get(bin)?.[0] ?? -1) : -1;
+        req = k >= 0 && m ? (store.reqs.get(m.owners[k].rid) ?? null) : null;
+      }
     }
     overlay.setHover(req, ev.clientX, ev.clientY);
     canvas.classList.toggle('over', !!hit);

@@ -11,7 +11,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 FLOW_VERSION = 0
 
@@ -59,6 +59,7 @@ class EventSink:
         self._fh = open(path, "a", buffering=1) if path else None
         self._subs: set[asyncio.Queue[dict[str, Any]]] = set()
         self.dropped = 0
+        self.on_publish: Callable[[dict[str, Any]], None] | None = None
 
     def emit(self, type_: str, **fields: Any) -> dict[str, Any]:
         ev = {"v": FLOW_VERSION, "type": type_, "t_ns": now_ns(), "src": self.src, **fields}
@@ -66,6 +67,8 @@ class EventSink:
 
     def publish(self, ev: dict[str, Any]) -> dict[str, Any]:
         """Write and fan out an already-built event (keeps its own src and t_ns)."""
+        if self.on_publish:
+            self.on_publish(ev)
         if self._fh:
             self._fh.write(json.dumps(ev, separators=(",", ":"), default=str) + "\n")
         for q in self._subs:

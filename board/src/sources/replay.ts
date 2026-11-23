@@ -65,7 +65,7 @@ export class ReplaySource implements Source {
           const e = evs[i++];
           // a recording says so in the header, with the time it was recorded
           const rec = e.type === 'hello'
-            ? { label: 'Recorded specimen', replay: { file: this.url, speed: this.speed, recorded_utc: new Date((e.t_ns ?? t0) / 1e6).toISOString().slice(0, 16).replace('T', ' ') } }
+            ? { label: (e as { label?: string }).label || 'Recorded specimen', replay: { file: this.url, speed: this.speed, recorded_utc: new Date((e.t_ns ?? t0) / 1e6).toISOString().slice(0, 16).replace('T', ' ') } }
             : {};
           emit({ ...e, ...rec, t_ns: (e.t_ns ?? t0) + shift, ...(e.rid && tag ? { rid: `${e.rid}${tag}` } : {}) } as Msg);
         }

@@ -210,7 +210,7 @@ export class Overlay {
       `<div class="row ${on ? '' : 'off'}"><span class="sw" style="background:${color}"></span><span><b>${name}</b> — ${what}<span class="st ${on ? 'on' : ''}">${on ? 'live' : 'unstained'}</span></span></div>`;
     const legendHtml = [
       row(cov.requests, 'var(--crimson)', 'Crimson cells', 'requests (one per HTTP request)'),
-      row(cov.kv, 'var(--ultra)', 'Ultramarine', 'KV blocks in GPU memory, to scale · solid = live · deep = shared prefix · hollow = cached, reusable'),
+      row(cov.kv, 'var(--ultra)', 'Ultramarine colony', 'one running request’s KV, to scale (its pages can sit anywhere in memory) · dark centre = the prefix it found in the cache · ringed dark core = KV that two or more running requests hold at once · hatching = cached, no running request'),
       row(cov.requests, 'var(--crimson)', 'Crimson veins', 'tokens streaming back; width = tokens/s'),
       row(cov.gpu, 'var(--sap)', 'Green neuron', cov.steps ? 'one GPU; fires each scheduler step' : 'one GPU; activity = utilisation'),
       `<div class="foot">${TAG_LEGEND}. Unstained parts are signals this engine does not report.</div>`,
@@ -412,8 +412,9 @@ export class Overlay {
         e = el('div', 'lbl fam region', this.root);
         this.famLabels.set('map:shared', e);
       }
-      // a cell counts if any of its tokens are shared, so this is a share of cells, not of tokens
-      e.innerHTML = `shared prefix ▸<span class="n">${Math.round(ms.share * 100)}% of cells ${tag('m')}</span>`;
+      e.innerHTML = ms.tokens
+        ? `shared ▸<span class="n">${pctTxt(ms.share)}% of tokens ${tag('m')}</span>`
+        : `shared prefix ▸<span class="n">${Math.round(ms.share * 100)}% of cells ${tag('m')}</span>`;
       place(e, ms.x, ms.y);
     }
     for (const f of this.scene.familyLabels()) {
@@ -423,7 +424,7 @@ export class Overlay {
         e = el('div', 'lbl fam', this.root);
         this.famLabels.set(f.id, e);
       }
-      e.innerHTML = `shared prefix<span class="n">${fmtK(f.tokens)} tok · reused by ${f.members} running requests ${tag('m')}</span>`;
+      e.innerHTML = `shared prefix<span class="n">${fmtK(f.tokens)} tok · held by ${f.members} running requests ${tag(f.measured ? 'm' : 'e')}</span>`;
       place(e, f.x, f.y);
     }
     for (const [id, e] of this.famLabels) {
@@ -584,6 +585,7 @@ const KEY_HTML = `
   <p>A request (crimson cell) waits at the proxy, crosses the membrane into the engine, and its prompt becomes KV cache (ultramarine). Generated tokens leave as crimson veins: <b>request → traffic class → engine instance → clients</b>. Green neurons below are the GPUs.</p>
   <p>Positions and curves are layout; sizes, counts and rates are measured or derived — every value carries a tag: ● measured, ◐ derived, ○ estimated.</p>
   <div class="legend klegend"></div>
+  <p>One vein per running request, from the rim of its colony; veins pass beneath other colonies. <b>M</b> shows the memory map: the KV pool in its real order, each cell split by what its tokens are (own, reused from the cache, shared, cached, free).</p>
   <p class="hint">Scroll to zoom · drag to pan · click anything to inspect · double-click to fly to it · space pauses · F follows a request · M toggles the KV memory map.</p>`;
 
 const KEY_SEEN = 'io.board.keySeen';
@@ -617,7 +619,8 @@ function kvLine(s: Store, scene: Scene, usage: number | null, name: string | und
     l1 = `live ${pctTxt(usage)}% ${tag('m')} · cached ≈${pctTxt(cached)}% ${tag('e')} · free ${pctTxt(Math.max(0, 1 - usage - cached))}% ${tag('e')}`;
   }
   const p = s.prefixLive();
-  const pre = p.tokenRate != null ? `prefix hit ${Math.round(p.tokenRate * 100)}% ${tag('d')}` : s.engine?.prefix_hit_rate != null ? `prefix hit ${Math.round(s.engine.prefix_hit_rate * 100)}% ${tag('m')}` : '';
+  // the engine's own count (same as the header); per-request counts from the proxy when the engine gives none
+  const pre = s.engine?.prefix_hit_rate != null ? `prefix hit ${Math.round(s.engine.prefix_hit_rate * 100)}% ${tag('m')}` : p.tokenRate != null ? `prefix hit ${Math.round(p.tokenRate * 100)}% ${tag('d')}` : '';
   const read = scene.kvRead > 1 ? `read ${fmtK(scene.kvRead)} tok/s ${tag('d')}` : '';
   const l2 = [pre, read].filter(Boolean).join(' · ');
   return l2 ? `${l1}<br>${l2}` : l1;
@@ -638,6 +641,14 @@ export function kvBytesPerToken(model: string | null | undefined): number | null
 function mapLine(s: Store, scene: Scene): string {
   const m = scene.mapFor(0);
   if (!m) return `not reported yet — waiting for kv.map`;
+  if (m.tokens && m.capacityTokens) {
+    // format 2: exact token shares, every slot counted once
+    const t = m.tokens;
+    const q = (n: number) => `${pctTxt(n / m.capacityTokens)}%`;
+    const side2 = Math.sqrt(m.bins);
+    const grid2 = Number.isInteger(side2) ? `${side2}×${side2}` : `${fmtInt(m.bins)} cells`;
+    return `${grid2} · cell = ${fmtInt(m.binTokens)} tok ${tag('m')}<br>tokens: own ${q(t.own)} · reused ${q(t.reused)} · shared ${q(t.shared)} ${tag('m')}<br>cached ${q(t.cached)} · free ${q(t.free)} ${tag('m')}`;
+  }
   let own = 0;
   let reused = 0;
   let shared = 0;

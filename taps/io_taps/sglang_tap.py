@@ -23,7 +23,8 @@ from . import UdpSender
 
 _tx: UdpSender | None = None
 _seq = 0
-_hello_sent = False
+_hello_sent = -1e9  # monotonic time of the last tap.hello
+HELLO_EVERY = 30.0
 _reported: "OrderedDict[str, None]" = OrderedDict()
 
 
@@ -128,6 +129,47 @@ def _finished(batch: Any) -> list[dict[str, Any]]:
     return out
 
 
+_out_len: "OrderedDict[str, int]" = OrderedDict()  # rid -> output tokens seen so far
+_prefilled: "OrderedDict[str, None]" = OrderedDict()  # requests whose prefix lookup was counted
+
+
+def _prefix_once(batch: Any, decoding: Any) -> tuple[int, int] | None:
+    """Prefix-cache lookups, each request once at its first prefill chunk: prompt tokens, and how many of them it
+    found in the cache (SGLang's per-request count, the one the API reports). Per-chunk counters would count a
+    chunked prompt's earlier chunks as hits again."""
+    dec = {id(r) for r in (decoding or [])}
+    q = h = 0
+    for r in _g(batch, "reqs", []) or []:
+        rid = str(_g(r, "rid", "") or "")
+        if id(r) in dec or not rid or rid in _prefilled:
+            continue
+        _prefilled[rid] = None
+        q += len(_g(r, "origin_input_ids", []) or [])
+        h += int(_g(r, "cached_tokens", 0) or 0)
+    while len(_prefilled) > 50_000:
+        _prefilled.popitem(last=False)
+    return (q, h) if q else None
+
+
+def _generated(reqs: list[Any]) -> int | None:
+    """Tokens appended to requests' outputs in this step (first tokens and accepted drafts included)."""
+    total, seen = 0, False
+    for r in reqs:
+        out = _g(r, "output_ids")
+        if out is None:
+            continue
+        seen = True
+        rid = str(_g(r, "rid", ""))
+        n = len(out)
+        total += max(0, n - _out_len.get(rid, 0))
+        # finished requests stay in the table: with overlap scheduling they can appear in the next batch too
+        _out_len[rid] = n
+        _out_len.move_to_end(rid)
+    while len(_out_len) > 20_000:
+        _out_len.popitem(last=False)
+    return total if seen else None
+
+
 def on_result(ret: Any, sched: Any, batch: Any = None, result: Any = None, *args: Any, **kwargs: Any) -> None:
     """AFTER hook on Scheduler.process_batch_result(self, batch, result)."""
     global _seq, _hello_sent
@@ -137,9 +179,9 @@ def on_result(ret: Any, sched: Any, batch: Any = None, result: Any = None, *args
             return
         dp_size = _g(_g(sched, "server_args"), "dp_size", 1) or 1
         instance = f"{_tx.instance}.dp{ranks['dp_rank']}" if dp_size > 1 else _tx.instance
-        if not _hello_sent:
+        if time.monotonic() - _hello_sent > HELLO_EVERY:  # repeated, so a restarted collector learns the config
             _hello(sched, instance, ranks)
-            _hello_sent = True
+            _hello_sent = time.monotonic()
         mode = _g(batch, "forward_mode")
         if mode is None or (hasattr(mode, "is_idle") and mode.is_idle()):
             return
@@ -150,6 +192,9 @@ def on_result(ret: Any, sched: Any, batch: Any = None, result: Any = None, *args
         gen_reqs = (len(decoding) if decoding else 0) if is_mixed else (0 if is_extend else n)
         ctx_tokens = (_int(_g(batch, "extend_num_tokens")) or 0) if (is_extend or is_mixed) else 0
         extra = _int(_g(result, "num_correct_drafts"))
+        gen = _generated(_g(batch, "reqs", []) or [])
+        if gen is None:
+            gen = gen_reqs + (extra or 0)
         launch = _g(batch, "launch_ts")
         msg: dict[str, Any] = {
             "type": "engine.step", "engine": "sglang", "instance": instance, "seq": _seq,
@@ -160,12 +205,12 @@ def on_result(ret: Any, sched: Any, batch: Any = None, result: Any = None, *args
                 "ctx_reqs": (n - gen_reqs) if (is_extend or is_mixed) else 0,
                 "ctx_tokens": ctx_tokens,
                 "gen_reqs": gen_reqs,
-                "gen_tokens": gen_reqs + (extra or 0),
+                "gen_tokens": gen,
                 "elapsed_ms": (time.monotonic() - launch) * 1000 if isinstance(launch, float) else None,
                 "dummy": False,
                 "cuda_graph": _g(result, "can_run_cuda_graph"),
             },
-            "gen_tokens": gen_reqs + (extra or 0),
+            "gen_tokens": gen,
         }
         _seq += 1
         pso = _g(sched, "pool_stats_observer")
@@ -175,17 +220,16 @@ def on_result(ret: Any, sched: Any, batch: Any = None, result: Any = None, *args
                 msg["kv_usage"] = _g(ps, "full_token_usage")
             except Exception:
                 pass
-        stats = _g(batch, "prefill_stats")
-        if stats is not None:
-            new, hit = _int(_g(stats, "log_input_tokens")), _int(_g(stats, "log_hit_tokens"))
-            if new is not None and hit is not None and new + hit > 0:
-                msg["prefix"] = {"queries": new + hit, "hits": hit}
+        if is_extend or is_mixed:
+            pre = _prefix_once(batch, decoding if is_mixed else None)
+            if pre:
+                msg["prefix"] = {"queries": pre[0], "hits": pre[1]}
         fin = _finished(batch)
         if fin:
             msg["finished"] = fin
         msg["batch"] = _batch_members(batch, is_extend, is_mixed, decoding, extra)
         _tx.send(msg)
-        _kv_map_tick(sched, instance)
+        _kv_map_tick(sched, instance, batch)
     except Exception:
         pass  # a tap must never break the engine
     return None
@@ -208,30 +252,49 @@ def _batch_members(batch: Any, is_extend: bool, is_mixed: bool, decoding: Any, e
 
 
 # ---- KV memory map ---------------------------------------------------------------------------
-# Every KV_MAP_EVERY seconds: which KV slots each running request holds, and which are free, binned
-# for drawing. GPU reads go on a side stream with a non-blocking copy, and are turned into a message on
-# a later tick once the copy has landed, so the scheduler thread never waits on the GPU.
+# Every KV_MAP_EVERY seconds, every KV slot is classified exactly:
+#   shared  referenced by two or more running requests (counted once)
+#   reused  referenced by one running request, inside the prefix it found in the cache at admission
+#   own     referenced by one running request, computed or generated by it
+#   cached  allocated, referenced by no running request (the radix tree keeps it for reuse)
+#   free    on the allocator's free list
+# The message carries exact token totals, per-cell token counts (as levels of the cell size, for
+# drawing), and per request: tokens, cached tokens, shared tokens, its sharing group and the cells it
+# touches. GPU work runs on a side stream with a non-blocking copy and is turned into a message on a
+# later tick once the copy has landed, so the scheduler thread never waits on the GPU.
 
 BATCH_MAX = 512
 KV_MAP_EVERY = float(os.environ.get("IO_KV_MAP_EVERY", "1.0"))
 KV_MAP_BINS = 4096
+KV_MAP_BUDGET = 60_000  # bytes per datagram
 _kv_last = 0.0
 _kv_pending: dict[str, Any] | None = None
 _kv_stream = None
 
 
-def _ranges(sorted_bins: list[int]) -> list[list[int]]:
-    """[1,2,3,7,8] -> [[1,4],[7,9]] (half-open)."""
-    out: list[list[int]] = []
-    for b in sorted_bins:
-        if out and out[-1][1] == b:
-            out[-1][1] = b + 1
-        else:
-            out.append([b, b + 1])
+def _kv_reqs(sched: Any, batch: Any) -> list[Any]:
+    """Requests that hold KV right now: the running batch, the batch whose results are being processed, the
+    batches already launched behind it (overlap scheduling keeps them in result_queue), the chunked prefill."""
+    out, seen = [], set()
+    launched = [_g(b, "reqs", []) or [] for b, *_ in list(_g(sched, "result_queue", None) or [])]
+    for group in (_g(_g(sched, "running_batch"), "reqs", []) or [], _g(batch, "reqs", []) or [], *launched,
+                  [_g(sched, "chunked_req")]):
+        for r in group:
+            rid = str(_g(r, "rid", "") or "")
+            if not rid or rid in seen:
+                continue
+            fin = _g(r, "finished")
+            try:
+                if callable(fin) and fin():
+                    continue
+            except Exception:
+                pass
+            seen.add(rid)
+            out.append(r)
     return out
 
 
-def _kv_map_tick(sched: Any, instance: str) -> None:
+def _kv_map_tick(sched: Any, instance: str, batch: Any = None) -> None:
     global _kv_last, _kv_pending, _kv_stream
     if KV_MAP_EVERY <= 0:
         return
@@ -251,82 +314,130 @@ def _kv_map_tick(sched: Any, instance: str) -> None:
     if pool is None or alloc is None:
         return
     page = int(_g(alloc, "page_size", 1) or 1)
-    cap = int(_g(alloc, "size", 0) or 0)  # KV capacity in tokens (slot 0 is reserved padding)
+    cap = int(_g(alloc, "size", 0) or 0)  # KV capacity in tokens; slot 0 is reserved padding
     if cap <= 0:
         return
-    # SGLang 0.5.23 keeps a request's KV bookkeeping in req.kv (ReqKvInfo): req_pool_idx is its row in
-    # req_to_token, kv_committed_len how many tokens of KV have actually been written.
-    rids, rows, lens, prefix = [], [], [], []
     width = pool.shape[1]
-    seen = set()
-    for r in (_g(_g(sched, "running_batch"), "reqs", []) or []):
+    rids, rows, lens, cached, protected = [], [], [], [], []
+    for r in _kv_reqs(sched, batch):
         kvi = _g(r, "kv")
         idx = _g(kvi, "req_pool_idx", _g(r, "req_pool_idx"))
-        rid = str(_g(r, "rid", ""))
-        if idx is None or rid in seen:
+        if idx is None:
             continue
-        seen.add(rid)
-        n = _g(kvi, "kv_committed_len", 0) or _g(kvi, "kv_allocated_len", 0) or int(r.seqlen)
+        n = _g(kvi, "kv_allocated_len", 0) or _g(kvi, "kv_committed_len", 0) or int(r.seqlen)  # slots it holds
         n = min(int(n), width)
-        if n > 0:
-            rids.append(rid)
-            rows.append(int(idx))
-            lens.append(n)
-            # [0, cache_protected_len) is owned by the radix tree: prefix reused from (or published to)
-            # the cache. Pages past it are this request's own.
-            prefix.append(min(n, int(_g(kvi, "cache_protected_len", 0) or 0)))
-    bin_tokens = -(-(cap + 1) // KV_MAP_BINS)
+        if n <= 0:
+            continue
+        rids.append(str(r.rid))
+        rows.append(int(idx))
+        lens.append(n)
+        cached.append(min(n, int(_g(r, "cached_tokens", 0) or 0)))
+        protected.append(min(n, int(_g(kvi, "cache_protected_len", 0) or 0)))
+    # the radix tree's own accounting at this instant, so readers can check the map against the engine
+    tc = _g(sched, "tree_cache")
+    sizes: dict[str, int | None] = {}
+    for k in ("evictable", "protected"):
+        f = _g(tc, f"{k}_size")
+        try:
+            sizes[k] = int(f()) if callable(f) else None
+        except Exception:
+            sizes[k] = None
+    bins = KV_MAP_BINS
+    bt = -(-(cap + 1) // bins)
     if _kv_stream is None:
         _kv_stream = torch.cuda.Stream(device=pool.device)
+    _kv_stream.wait_stream(torch.cuda.current_stream(pool.device))
     with torch.cuda.stream(_kv_stream):
-        parts = [pool[row, :n] for row, n in zip(rows, lens)]
-        owned = (torch.cat(parts).to(torch.int64) // bin_tokens) if parts else torch.empty(0, dtype=torch.int64, device=pool.device)
+        dev = pool.device
+        nreq = len(rows)
+        zeros = torch.zeros(bins, dtype=torch.int64, device=dev)
+        own_c = reused_c = shared_c = zeros
+        per_req = torch.zeros((3, max(1, nreq)), dtype=torch.int64, device=dev)
+        touch = torch.zeros((max(1, nreq), bins), dtype=torch.bool, device=dev)
+        if nreq:
+            slots = torch.cat([pool[row, :n] for row, n in zip(rows, lens)]).to(torch.int64)
+            lens_t = torch.tensor(lens, device=dev)
+            req_i = torch.repeat_interleave(torch.arange(nreq, device=dev), lens_t)
+            starts = torch.cumsum(lens_t, 0) - lens_t
+            pos = torch.arange(slots.numel(), device=dev) - starts[req_i]
+            reused = (pos < torch.tensor(cached, device=dev)[req_i]).to(torch.int64)
+            # only the tree-owned part [0, cache_protected_len) can be shared; the rest is the request's own
+            tree = (pos < torch.tensor(protected, device=dev)[req_i]).to(torch.int64)
+            uniq, inv = torch.unique(slots, return_inverse=True)  # every physical slot counted once
+            nu = uniq.numel()
+            multi = torch.zeros(nu, dtype=torch.int64, device=dev).scatter_add_(0, inv, tree) > 1
+            reused_u = torch.zeros(nu, dtype=torch.int64, device=dev).scatter_reduce_(0, inv, reused, "amax")
+            ubin = (uniq // bt).clamp_(max=bins - 1)
+            single = ~multi
+            shared_c = torch.bincount(ubin[multi], minlength=bins)[:bins]
+            reused_c = torch.bincount(ubin[single & (reused_u > 0)], minlength=bins)[:bins]
+            own_c = torch.bincount(ubin[single & (reused_u == 0)], minlength=bins)[:bins]
+            shared_slot = multi[inv] & (tree > 0)
+            # sharing groups: each shared slot belongs to the lowest request index that holds it in its prefix
+            ref = torch.where(tree > 0, req_i, torch.full_like(req_i, nreq))
+            leader_u = torch.full((nu,), nreq, dtype=torch.int64, device=dev).scatter_reduce_(0, inv, ref, "amin")
+            leader = leader_u[inv]
+            per_req[0] = torch.bincount(req_i[shared_slot], minlength=nreq)[:nreq]
+            per_req[1] = torch.full((nreq,), nreq, dtype=torch.int64, device=dev).scatter_reduce_(
+                0, req_i[shared_slot], leader[shared_slot], "amin")
+            per_req[2] = torch.bincount(leader_u[multi], minlength=nreq)[:nreq]
+            touch[req_i, (slots // bt).clamp_(max=bins - 1)] = True
         frees = [t for t in (_g(alloc, "free_pages"), _g(alloc, "release_pages")) if t is not None and t.numel()]
-        free_tok = (torch.cat(frees).to(torch.int64) * page) if frees else torch.empty(0, dtype=torch.int64, device=pool.device)
-        free_count = torch.bincount(free_tok // bin_tokens, minlength=KV_MAP_BINS)[:KV_MAP_BINS] * page
-        owned_cpu = owned.to("cpu", non_blocking=True)
-        free_cpu = free_count.to("cpu", non_blocking=True)
+        for t in frees:
+            t.record_stream(_kv_stream)  # the allocator may replace these tensors while this stream reads them
+        free_tok = (torch.cat(frees).to(torch.int64) * page) if frees else torch.empty(0, dtype=torch.int64, device=dev)
+        free_c = torch.bincount((free_tok // bt).clamp_(max=bins - 1), minlength=bins)[:bins] * page
+        counts = torch.stack([own_c, reused_c, shared_c, free_c]).to("cpu", non_blocking=True)
+        per_req_cpu = per_req.to("cpu", non_blocking=True)
+        touch_cpu = touch.to("cpu", non_blocking=True)
         event = torch.cuda.Event()
         event.record(_kv_stream)
-    _kv_pending = {"event": event, "rids": rids, "lens": lens, "prefix": prefix, "owned": owned_cpu, "free": free_cpu,
-                   "cap": cap, "bin_tokens": bin_tokens, "t_ns": time.time_ns()}
+    _kv_pending = {"event": event, "rids": rids, "lens": lens, "cached": cached, "protected": protected,
+                   "counts": counts, "per_req": per_req_cpu, "touch": touch_cpu, "cap": cap, "bin_tokens": bt,
+                   "tree": sizes, "t_ns": time.time_ns()}
+
+
+def _b64(a: Any) -> str:
+    import base64
+
+    return base64.b64encode(a.tobytes()).decode()
 
 
 def _kv_emit(p: dict[str, Any], instance: str) -> None:
-    owned = p["owned"].tolist()
-    free_count = p["free"].tolist()
-    per_req, off = [], 0
-    for n, pre in zip(p["lens"], p["prefix"]):
-        seg = owned[off: off + n]
-        per_req.append((set(seg[:pre]), set(seg[pre:])))
-        off += n
-    # Coarsen until the datagram fits (heavy fragmentation means many ranges).
+    import numpy as np
+
+    counts = p["counts"].numpy()  # own, reused, shared, free per cell
+    cap, bt, nreq = p["cap"], p["bin_tokens"], len(p["rids"])
+    bins = counts.shape[1]
+    size = np.full(bins, bt, dtype=np.int64)
+    size[-1] = (cap + 1) - bt * (bins - 1)  # slots 0..cap
+    size[0] -= 1  # slot 0 is reserved padding
+    cells = np.vstack([counts, np.zeros((1, bins), dtype=np.int64)])
+    cells[4] = np.maximum(0, size - counts.sum(axis=0))  # cached: allocated, no running request
+    own, reused, shared, free = (int(x) for x in counts.sum(axis=1))
+    totals = {"own": own, "reused": reused, "shared": shared, "free": free,
+              "cached": max(0, cap - own - reused - shared - free)}
+    per_req = p["per_req"].numpy()
+    touch = p["touch"].numpy()
     for f in (1, 2, 4, 8, 16):
-        bins = KV_MAP_BINS // f
-        bt = p["bin_tokens"] * f
-        owners, owned_bins, prefix_count = [], set(), {}
-        for rid, n, pre, (pset, oset) in zip(p["rids"], p["lens"], p["prefix"], per_req):
-            pb = sorted({b // f for b in pset})
-            ob = sorted({b // f for b in oset})
-            owned_bins.update(pb)
-            owned_bins.update(ob)
-            for b in pb:
-                prefix_count[b] = prefix_count.get(b, 0) + 1
-            owners.append({"rid": rid, "tokens": n, "prefix_tokens": pre,
-                           "prefix_ranges": _ranges(pb), "own_ranges": _ranges(ob),
-                           "ranges": _ranges(sorted(set(pb) | set(ob)))})
-        # True sharing: prefix pages referenced by two or more running requests at once.
-        shared_bins = sorted(b for b, c in prefix_count.items() if c >= 2)
-        fc = [sum(free_count[i * f:(i + 1) * f]) for i in range(bins)]
-        free_bins = [b for b, c in enumerate(fc) if c >= bt * 0.5]
-        free_set = set(free_bins)
-        cached_bins = [b for b in range(bins) if b not in free_set and b not in owned_bins]
-        msg = {"type": "kv.map", "engine": "sglang", "instance": instance, "t_ns": p["t_ns"],
-               "capacity_tokens": p["cap"], "bin_tokens": bt, "bins": bins,
-               "used_tokens": p["cap"] - int(sum(free_count)), "owned_tokens": int(sum(p["lens"])),
-               "owners": owners, "shared": _ranges(shared_bins),
-               "free": _ranges(free_bins), "cached": _ranges(cached_bins)}
-        if len(json.dumps(msg, separators=(",", ":"))) < 60_000:
+        nb = bins // f
+        csize = size.reshape(nb, f).sum(axis=1)
+        lv = np.rint(255 * cells.reshape(5, nb, f).sum(axis=2) / np.maximum(1, csize)).clip(0, 255).astype(np.uint8)
+        tb = touch[:nreq].reshape(nreq, nb, f).any(axis=2) if nreq else touch[:0]
+        owners = []
+        for i, rid in enumerate(p["rids"]):
+            g = int(per_req[1, i])
+            owners.append({"rid": rid, "tokens": p["lens"][i], "cached_tokens": p["cached"][i],
+                           "prefix_tokens": p["protected"][i], "shared_tokens": int(per_req[0, i]),
+                           "group": p["rids"][g] if g < nreq else None,
+                           "group_tokens": int(per_req[2, g]) if g < nreq else 0,
+                           "cells": _b64(np.packbits(tb[i]))})
+        msg = {"type": "kv.map", "engine": "sglang", "instance": instance, "t_ns": p["t_ns"], "format": 2,
+               "capacity_tokens": cap, "bin_tokens": bt * f, "bins": nb, "tokens": totals,
+               "used_tokens": cap - free, "owned_tokens": own + reused + shared, "tree": p["tree"],
+               "cells": {k: _b64(lv[j]) for j, k in enumerate(("own", "reused", "shared", "free", "cached"))},
+               "owners": owners}
+        if len(json.dumps(msg, separators=(",", ":"))) < KV_MAP_BUDGET:
             break
     _tx.send(msg)
 

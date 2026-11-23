@@ -1,6 +1,6 @@
 // Fig. 2: prompt vs output tokens per request (log–log), coloured by traffic class.
 // Below the diagonal a request is prefill-heavy, above it decode-heavy.
-import { displayRid, trafficClass, type Store } from '../state';
+import { classLabel, displayRid, trafficClass, type Store } from '../state';
 import { classInk, fmtInt, inkCss } from '../util';
 import { draggable } from './draggable';
 
@@ -82,7 +82,7 @@ export class Fig2 {
         const c = inkCss(classInk(p.cls), p.live ? 1 : 0.9);
         const on = p.rid === follow;
         const edge = inkCss(classInk(p.cls).map((v) => v * 0.6) as unknown as [number, number, number], 1);
-        return `<circle data-rid="${esc(p.rid)}" cx="${lx(p.x).toFixed(1)}" cy="${ly(p.y).toFixed(1)}" r="${on ? 4.8 : p.live ? 3.4 : 2.9}" fill="${p.live ? 'none' : c}" stroke="${on ? '#5e0418' : edge}" stroke-width="${on ? 1.8 : p.live ? 1.4 : 0.9}"><title>${esc(displayRid(p.rid))} · ${p.cls} · ${fmtInt(p.x)} prompt → ${fmtInt(p.y)} output${p.live ? ' (so far)' : ''}</title></circle>`;
+        return `<circle data-rid="${esc(p.rid)}" cx="${lx(p.x).toFixed(1)}" cy="${ly(p.y).toFixed(1)}" r="${on ? 4.8 : p.live ? 3.4 : 2.9}" fill="${p.live ? 'none' : c}" stroke="${on ? '#5e0418' : edge}" stroke-width="${on ? 1.8 : p.live ? 1.4 : 0.9}"><title>${esc(displayRid(p.rid))} · ${esc(classLabel(p.cls))} · ${fmtInt(p.x)} prompt → ${fmtInt(p.y)} output${p.live ? ' (so far)' : ''}</title></circle>`;
       })
       .join('');
     // diagonal: output = prompt
@@ -99,6 +99,6 @@ export class Fig2 {
         <text x="11" y="${(PAD.t + H - PAD.b) / 2}" class="ax" transform="rotate(-90 11 ${(PAD.t + H - PAD.b) / 2})">output tokens →</text>
         ${dots}
       </svg>
-      <div class="cls">${classes.map((c) => `<span><i style="background:${inkCss(classInk(c))}"></i>${esc(c)}</span>`).join('')}${pts.length ? '' : '<em>no finished requests yet</em>'}<span class="hint">○ live · ● done · hover to follow</span></div>`;
+      <div class="cls">${classes.map((c) => `<span><i style="background:${inkCss(classInk(c))}"></i>${esc(classLabel(c))}</span>`).join('')}${pts.length ? '' : '<em>no finished requests yet</em>'}<span class="hint">○ live · ● done · hover to follow</span></div>`;
   }
 }

@@ -4,21 +4,23 @@ A live view inside an LLM inference engine. Every request, scheduler step, KV-ca
 hit from **SGLang** or **vLLM** is drawn as it happens, and advisor agents post tuning proposals next
 to the evidence.
 
-![The board, SGLang serving Mooncake agent traffic](docs/board.png)
+![The board, SGLang serving GitHub Copilot agent sessions](docs/board.png)
 
-Video (24 s): [docs/demo.mp4](docs/demo.mp4), SGLang 0.5.19 on one RTX 4060 Ti, agent traffic from the
-Mooncake production trace.
+Video (31 s): [docs/demo.mp4](docs/demo.mp4). SGLang 0.5.19 on one RTX 4060 Ti, serving GitHub Copilot
+coding-agent sessions replayed from the June 2026 production traces. A new session's 11,139-token prompt
+takes 2.07 s to its first token; the same session's next call finds 10,973 of its 11,006 tokens in the
+cache and takes 100 ms.
 
 ## What the board shows
 
 | On the board | Signal | Source |
 |---|---|---|
 | Crimson cells on the left | requests waiting at the proxy, then admitted into the engine | proxy |
-| Blue colonies inside the body | each running request's own KV cache, to scale against the KV pool | tap |
-| Dark core with rings | a prompt prefix shared by several running requests: one copy in memory, many readers | tap, proxy |
-| Hatched field | prefixes kept in cache for reuse (allocated, no running request) | tap |
-| Memory map (press **M**) | the KV pool cell by cell: a request's own tokens, shared prefixes, cached, free | tap (SGLang) |
-| Crimson veins | generated tokens leaving, per traffic class and per engine instance; width = tokens/s | proxy |
+| Blue colonies inside the body | one per running request: its KV cache, to scale against the KV pool. The dark centre is the prefix it found in the cache | tap |
+| Dark core with a ring | KV that two or more running requests hold at once: one copy in memory, several readers | tap |
+| Hatched field | KV kept in the cache with no running request (reusable until evicted) | tap |
+| Memory map (press **M**) | the KV pool in its real order, each cell split by its tokens: own, reused from the cache, shared, cached, free | tap (SGLang) |
+| Crimson veins | one per running request, from its colony, through its traffic class and engine instance; width = tokens/s | proxy |
 | Green neurons | GPUs; they fire on each scheduler step | NVML, tap |
 | Fig. 3 | every scheduler step: prefill tokens up, decoding requests down | tap |
 | Fig. 4 | dense models: tokens reused from cache vs computed, and time to first token, per request. MoE models: load on the busiest expert of each layer | proxy, tap |
@@ -39,10 +41,11 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:18300/?replay=/samples/sglang-mooncake-agent.jsonl&loop=1>.
+Open <http://127.0.0.1:18300/?replay=/samples/sglang-copilot-agent.jsonl&loop=1>.
 
-The sample is a recording of SGLang 0.5.19 serving granite-3.1-3b-a800m-instruct on one RTX 4060 Ti,
-with agent traffic from the Mooncake trace (see [Workloads](#workloads)).
+The sample is two minutes of SGLang 0.5.19 serving Qwen2.5-Coder-3B-Instruct on one RTX 4060 Ti, with
+GitHub Copilot agent sessions replayed from the production traces (see
+[Agent sessions](#agent-sessions-github-copilot-traces)).
 
 ## Connect SGLang
 
@@ -130,7 +133,7 @@ Tested with vLLM 0.32 and 0.34.
 | Per request: queue, prefill and decode time, cached tokens | yes | yes |
 | Prefix-cache lookups and hits | yes | yes |
 | Speculative decoding drafts and acceptance | yes | yes |
-| KV memory map | yes | no |
+| KV memory map, every slot classified | yes | no |
 | Expert routing | yes, with the sampler | no |
 
 ## Multi-GPU and multi-node: connect to rank 0
@@ -193,14 +196,63 @@ is full; shared prefixes are recomputed. Any tool can post notes: see [docs/even
 
 ## Workloads
 
-Replay a trace through the proxy. Requests are sent at their scheduled times, so overload shows up as
-queueing.
+`io-copilot` replays agent sessions in a closed loop. `io-replay` sends other traces through the proxy at
+their scheduled times, so overload shows up as queueing.
+
+### Agent sessions (GitHub Copilot traces)
+
+The GitHub Copilot coding-agent traces (Azure Public Dataset, June 2026) record 301k agent sessions:
+every model call with its timestamp, duration, and prompt, completion and cached token counts, and every
+tool run with its duration. They contain no text. `io-copilot` replays them against a live engine.
+
+- **Closed loop.** Each session starts at its recorded time. Each call waits for the call it followed,
+  then for the recorded gap (a tool run or a user pause). The engine's own speed sets the pace.
+- **Prompts.** Each call sends the session's conversation so far (the previous prompt and the engine's
+  own answer) plus filler text for the new content (tool output, the user's next message), sized to the
+  recorded prompt. A prompt much shorter than the conversation (context compaction) keeps only the
+  system part.
+- **Answers** are generated to the recorded length.
+- **Cache.** The engine's prefix cache decides what is reused. Production's cached count is logged next
+  to the engine's. The trace has no text, so prompts shared across sessions are not reproduced.
+
+Traffic classes on the board: new session, user turn, agent loop, and session in progress (the first
+call of a session that began before the replayed window; its cache starts empty).
+
+Run it on one GPU:
 
 ```bash
-io-replay traces/<trace>.jsonl --base http://127.0.0.1:18000 --out runs/live --no-salt
+curl -LO https://github.com/Azure/AzurePublicDataset/releases/download/ghcp-coding-agent-2026/date.2026-06-06.tar.gz
+tar -xzf date.2026-06-06.tar.gz          # creates date=2026-06-06/
+
+IO_TAP_URL=http://127.0.0.1:30000 python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-Coder-3B-Instruct --port 30000 \
+  --enable-metrics --enable-cache-report --context-length 32768 --cuda-graph-max-bs-decode 32
+io-proxy --upstream http://127.0.0.1:30000 --rid-in-body &
+io-collector --engine sglang --engine-url http://127.0.0.1:30000 --gpus 0 --out runs/live \
+  --label "GitHub Copilot agent traces, June 2026" &
+io-copilot 'date=2026-06-06' --start 2026-06-06T13:00 --duration 14400 \
+  --sample 0.12 --prompt-scale 0.125 --out runs/live --loop
 ```
 
-**Production traffic (Mooncake).** Mooncake's open traces (Kimi, FAST '25) give, per request, the arrival
+- `--sample` replays that fraction of sessions, and `--prompt-scale` scales prompt sizes. These values
+  fit a 16 GB GPU, with a 166k-token KV cache.
+- `--cuda-graph-max-bs-decode 32`: on a small GPU, SGLang sizes CUDA graphs for decode batches up to 8,
+  and this replay runs more requests than that at once.
+- Every 30 s, `runs/live/copilot.log` gets a line with the share of prompt tokens the engine served
+  from its cache, next to production's, per traffic class. When the replay stops it writes
+  `copilot-summary.json` and `copilot-calls.jsonl`.
+
+On the run behind the sample and the video (349 calls):
+
+| Call | Prompt tokens from cache here | In production | Time to first token, p50 / p90 |
+|---|---|---|---|
+| agent loop (305) | 98% | 95% | 95 ms / 210 ms |
+| user turn (15) | 80% | 87% | 138 ms / 3.6 s |
+| new session (11) | 0% | 5% | 424 ms / 2.1 s |
+
+### Production traffic (Mooncake)
+
+Mooncake's open traces (Kimi, FAST '25) give, per request, the arrival
 time, the input and output lengths and one hash ID per 512-token prompt block. `io-mooncake` turns each
 hash ID into a fixed block of text, so prompts share prefixes exactly where the originals did.
 
@@ -208,16 +260,42 @@ hash ID into a fixed block of text, so prompts share prefixes exactly where the 
 curl -LO https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/toolagent_trace.jsonl
 io-mooncake toolagent_trace.jsonl --out traces/mooncake-agent.jsonl \
   --block-tokens 256 --duration 70 --stretch 3.5 --max-input 12000 --max-output 256 --spread
+io-replay traces/mooncake-agent.jsonl --base http://127.0.0.1:18000 --out runs/live --no-salt
 ```
 
 `--block-tokens` and `--stretch` scale the trace to a smaller GPU. The trace records arrivals at
-3-second resolution; `--spread` places each timestamp's requests evenly across those 3 seconds. The
-sample and the video use the values above. Replay Mooncake traces with `--no-salt`, which keeps the
-prompts as written.
+3-second resolution; `--spread` places each timestamp's requests evenly across those 3 seconds. Replay
+Mooncake traces with `--no-salt`, which keeps the prompts as written.
 
-**Synthetic workloads.** `io-traces --out traces` builds chat, agentic, RAG, burst and speculative
+### Synthetic workloads
+
+`io-traces --out traces` builds chat, agentic, RAG, burst and speculative
 workloads from MATH-500 prompts. By default `io-replay` makes each replay's prompts unique, so a
 repeated replay starts with a cold cache.
+
+## Checking the numbers
+
+`board/scripts/audit-live.mjs` opens the board on a live collector and compares its numbers with
+independent measurements: SGLang's own gauges for running requests and KV, and the token counts the
+engine returned through the API for every request. Needs Playwright with Chrome.
+
+```bash
+cd board && node scripts/audit-live.mjs http://127.0.0.1:30000 ../runs/live/collector.jsonl 120
+```
+
+On the run behind the sample (350 finished requests):
+
+| Board | Board value | Independent value |
+|---|---|---|
+| prompt tokens | 2,838,646 | 2,838,646 (API usage per request; 0 requests differ) |
+| cached tokens | 2,765,128 | 2,765,128 (API usage per request) |
+| generated tokens | 139,697 | 139,679 (API usage; requests still streaming) |
+| KV maps where cached = SGLang's evictable tokens at the same instant | 790 | 790 |
+| KV live / cached / free | 54.6% / 44.3% / 1.1% | 54.5% / 44.3% / 1.2% (`kv_used`, `kv_evictable`, `kv_available` gauges) |
+| TTFT p50 / p90, last 60 s | 102.79 / 270.56 ms | 102.74 / 270.49 ms (proxy events) |
+
+SGLang updates its gauges on its own logging interval, so under load they can trail the board by about a
+second.
 
 ## Recordings
 
@@ -237,6 +315,8 @@ repeated replay starts with a cold cache.
 Board URL parameters: `?ws=ws://<host>:<port>/ws`, `?replay=<url>&loop=1&speed=2`,
 `?mock=steady|burst|pd|rep` (synthetic data, labelled as such on the board).
 
+Collector: `--label` sets the caption on the board's plate.
+
 Tap environment: `IO_TAP_URL` (this server's address), `IO_TAP_INSTANCE` (instance name, default
 `engine`), `IO_TAP_HOST` and `IO_TAP_PORT` (collector), `IO_KV_MAP_EVERY` (seconds between KV maps,
 default 1).
@@ -244,7 +324,7 @@ default 1).
 | Path | |
 |---|---|
 | `taps/` | engine plugins: SGLang (`sglang.srt.plugins`) and vLLM (`vllm.stat_logger_plugins`) |
-| `harness/` | proxy, collector, advisor, replay tools, trace converters, expert sampler |
+| `harness/` | proxy, collector, advisor, agent-session replay, replay tools, trace converters, expert sampler |
 | `board/` | the board (TypeScript, WebGL2, Vite); `scripts/evaluate.mjs` is its visual test suite |
 | `docs/events.md` | the event format |
 
@@ -253,5 +333,10 @@ Board checks: `cd board && npx tsc --noEmit -p . && BOARD_URL=http://127.0.0.1:1
 
 ## License and data
 
-Apache-2.0. Mooncake traces: [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake). Synthetic
-workloads: [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500).
+Apache-2.0.
+
+- GitHub Copilot coding-agent traces: [Azure Public Dataset](https://github.com/Azure/AzurePublicDataset/blob/master/GitHubCopilotCodingAgentDataset2026.md),
+  CC-BY. Liu, Qiu, Goiri, Fonseca, Bianchini, Choukse, "Agentic Coding in the Wild: Characterizing GitHub
+  Copilot Traces at Production Scale", arXiv 2608.00101, 2026.
+- Mooncake traces: [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake).
+- Synthetic workloads: [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500).

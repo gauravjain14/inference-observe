@@ -297,6 +297,87 @@ On the run behind the sample (350 finished requests):
 SGLang updates its gauges on its own logging interval, so under load they can trail the board by about a
 second.
 
+## Host it publicly
+
+Only two things are public: the board, as static files on GitHub Pages, and a read-only copy of the stream
+through a Cloudflare tunnel. The engine, the proxy and the collector stay on `127.0.0.1`.
+
+```
+browser ── board ─────────────── GitHub Pages
+   └──── wss://live.<domain>/ws ── Cloudflare tunnel ── io-relay :18240 ── collector :18220
+```
+
+**1. Relay.** It holds one connection to the collector and sends the same frames to every viewer.
+
+```bash
+io-relay --upstream ws://127.0.0.1:18220/ws --port 18240 \
+  --allow-origin https://<user>.github.io --trust-cloudflare
+```
+
+- It serves `GET /ws` and nothing else, and disconnects any viewer that sends data.
+- It accepts at most 200 viewers, and 4 per address (`--max-viewers`, `--max-per-ip`).
+- It drops viewers that fall behind, so a stalled client cannot grow its memory.
+- It accepts browsers only from the page's origin, and removes local file paths from the stream.
+
+**2. Tunnel.** This needs a Cloudflare account and a domain on Cloudflare.
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create inference-observe
+cloudflared tunnel route dns inference-observe live.<domain>
+```
+
+`~/.cloudflared/config.yml` sends `/ws` to the relay and answers everything else with 404:
+
+```yaml
+tunnel: inference-observe
+credentials-file: /home/<you>/.cloudflared/<tunnel-id>.json
+ingress:
+  - hostname: live.<domain>
+    path: ^/ws$
+    service: http://127.0.0.1:18240
+  - service: http_status:404
+```
+
+Check a rule with `cloudflared tunnel ingress rule https://live.<domain>/note` (it should match rule #1, the
+404). Run the tunnel with `cloudflared tunnel run inference-observe`, or install it as a service with
+`sudo cloudflared service install`.
+
+**3. Board on GitHub Pages.**
+
+```bash
+cd board
+VITE_PUBLIC_WS=wss://live.<domain>/ws npx vite build --base=/<repo>/
+```
+
+A build with `VITE_PUBLIC_WS`:
+- shows only that feed and recordings from its own site; `?ws=` and other sites' `?replay=` are ignored;
+- carries a Content-Security-Policy that allows only its own files and that feed;
+- plays the bundled recording when the feed is down.
+
+Publish `board/dist/` on a `gh-pages` branch, then choose **Settings → Pages → Deploy from a branch**.
+
+**4. Check it from outside.**
+
+```bash
+io-check-public wss://live.<domain>/ws --origin https://<user>.github.io --page https://<user>.github.io/<repo>/
+```
+
+This connects as the page, tries other origins, other paths (including the proxy's and the collector's), sending
+data, and too many connections. It also reads the page's policy. Every line should read PASS.
+
+**What the stream contains:** the engine's version and configuration, the model, GPU telemetry, per-request
+timing and token counts, and a hash of each prompt's first 1,024 characters. It never contains prompt or
+response text.
+
+**Keep private:**
+- `~/.cloudflared/<tunnel-id>.json`, the tunnel's credentials.
+- The proxy (`:18000`), the engine, and the collector's other routes. Never point the tunnel at them.
+
+PyTorch's distributed store inside SGLang listens on all network interfaces on a random port. Block inbound
+connections with a host firewall, for example `ufw default deny incoming`. The tunnel only makes outbound
+connections, so it keeps working.
+
 ## Recordings
 
 - The collector writes `<out>/collector.jsonl`.
@@ -324,7 +405,7 @@ default 1).
 | Path | |
 |---|---|
 | `taps/` | engine plugins: SGLang (`sglang.srt.plugins`) and vLLM (`vllm.stat_logger_plugins`) |
-| `harness/` | proxy, collector, advisor, agent-session replay, replay tools, trace converters, expert sampler |
+| `harness/` | proxy, collector, advisor, agent-session replay, public relay, replay tools, trace converters, expert sampler |
 | `board/` | the board (TypeScript, WebGL2, Vite); `scripts/evaluate.mjs` is its visual test suite |
 | `docs/events.md` | the event format |
 

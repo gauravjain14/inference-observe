@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "Live flow board and advisor agents for LLM inference engines"
 requires-python = ">=3.12"
 dependencies = [
-    "aiohttp>=3.11",
+    "aiohttp>=3.13",
     "tokenizers>=0.21",
     "nvidia-ml-py>=12",
     "uvloop>=0.21",
@@ -19,6 +19,8 @@ io-advisor = "harness.advisor:main"
 io-replay-ws = "harness.replay_ws:main"
 io-mooncake = "harness.mooncake:main"
 io-copilot = "harness.copilot:main"
+io-relay = "harness.relay:main"
+io-check-public = "harness.check_public:main"
 
 [build-system]
 requires = ["hatchling"]

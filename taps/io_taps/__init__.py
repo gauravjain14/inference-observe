@@ -16,6 +16,8 @@ class UdpSender:
         self.url = os.environ.get("IO_TAP_URL")
         self.addr = (os.environ.get("IO_TAP_HOST", "127.0.0.1"), int(os.environ.get("IO_TAP_PORT", "18201")))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if self.addr[0].startswith("127.") or self.addr[0] == "localhost":
+            self.sock.bind(("127.0.0.1", 0))  # a local collector: the send socket is not reachable from the network
         self.sock.setblocking(False)
         self.sent = 0
         self.dropped = 0

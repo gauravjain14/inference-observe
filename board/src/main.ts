@@ -61,25 +61,38 @@ const status = (s: string) => {
   store.status = s;
 };
 
+// A public build (VITE_PUBLIC_WS set at build time) shows only its own feed and recordings from its own site:
+// links cannot point it at another server with ?ws= or ?replay=.
+const PUBLIC_WS: string | undefined = import.meta.env.VITE_PUBLIC_WS || undefined;
+const PUBLIC_FALLBACK = 'samples/sglang-copilot-agent.jsonl';
+const sameOrigin = (u: string) => {
+  try {
+    return new URL(u, location.href).origin === location.origin;
+  } catch {
+    return false;
+  }
+};
+
 function pickSource(): Source {
   const mock = params.get('mock');
   if (mock) return new MockSource((['steady', 'burst', 'pd', 'dp', 'rep'].includes(mock) ? mock : 'steady') as 'steady');
   const replay = params.get('replay');
-  if (replay) return new ReplaySource(replay, Number(params.get('speed') ?? 1) || 1, params.get('loop') === '1');
-  return new WsSource(params.get('ws') ?? 'ws://127.0.0.1:18200/ws');
+  if (replay && (!PUBLIC_WS || sameOrigin(replay))) return new ReplaySource(replay, Number(params.get('speed') ?? 1) || 1, params.get('loop') === '1');
+  return new WsSource(PUBLIC_WS ?? params.get('ws') ?? 'ws://127.0.0.1:18200/ws');
 }
 
 let source = pickSource();
 store.sourceLabel = source.label;
 source.start(emit, status);
 
-// Live is the default; if the socket never connects, fall back to the mock so the plate isn't empty.
-if (source instanceof WsSource && !params.has('ws') && params.get('fallback') !== '0') {
+// Live is the default; if the socket never connects, fall back so the plate isn't empty: a public build plays its
+// bundled recording, a local one the labelled mock.
+if (source instanceof WsSource && (PUBLIC_WS || !params.has('ws')) && params.get('fallback') !== '0') {
   window.setTimeout(() => {
     if (store.events === 0 && inbox.length === 0 && store.status !== 'connected') {
       source.stop();
-      source = new MockSource('steady');
-      store.sourceLabel = `${source.label} (live socket unavailable)`;
+      source = PUBLIC_WS ? new ReplaySource(PUBLIC_FALLBACK, 1, true) : new MockSource('steady');
+      store.sourceLabel = PUBLIC_WS ? source.label : `${source.label} (live socket unavailable)`;
       source.start(emit, status);
     }
   }, 4000);

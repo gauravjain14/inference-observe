@@ -87,7 +87,7 @@ class Replayer:
         if ev.get("type") == "hello":
             rec = time.strftime("%Y-%m-%d %H:%M", time.gmtime((ev.get("t_ns") or 0) / 1e9))
             ev = {**ev, "label": self.a.label or ev.get("label") or "Recorded specimen",
-                  "replay": {"file": str(self.path), "speed": self.a.speed, "recorded_utc": rec}}
+                  "replay": {"file": self.path.name, "speed": self.a.speed, "recorded_utc": rec}}
             self.hello = ev
         elif ev.get("type") in ("engine.tick", "gpu.tick", "kv.map", "moe.tick"):
             self.last[ev["type"]] = ev
@@ -203,7 +203,7 @@ class Replayer:
     async def health(self, request: web.Request) -> web.Response:
         return web.json_response({
             "hello": self.hello, "last_tick": self.last.get("engine.tick"),
-            "replay": {"file": str(self.path), "speed": self.a.speed,
+            "replay": {"file": self.path.name, "speed": self.a.speed,
                        "position_s": round((self.position_ns - self.rec_start_ns) / 1e9, 1) if self.position_ns else 0},
         }, dumps=lambda o: json.dumps(o, default=str))
 

@@ -194,7 +194,7 @@ with its duration. They contain no text. `io-copilot` replays them against a liv
 - **Prompts.** Each call sends the session's conversation so far (the previous prompt and the engine's own
   answer) plus filler text for the new content (tool output, the user's next message), sized to the recorded
   prompt. A prompt much shorter than the conversation (context compaction) keeps only the system part.
-- **Answers** are generated to the recorded length.
+- **Answers** are generated to the recorded length, up to `--max-output` tokens (default 1,024).
 - **Cache.** The engine's prefix cache decides what is reused. Production's cached count is logged next to the
   engine's. The trace has no text, so prompts shared across sessions are not reproduced.
 
@@ -216,6 +216,9 @@ io-copilot 'date=2026-06-06' --start 2026-06-06T13:00 --duration 14400 \
 
 - `--sample` replays that fraction of sessions, and `--prompt-scale` scales prompt sizes. These values fit a
   16 GB GPU, with a 166k-token KV cache.
+- In this window, 250 sessions are replayed (about 30 calls a minute). 7 sampled sessions are skipped because
+  their scaled prompts exceed `--max-prompt` (30,000 tokens). Answers stop at 1,024 tokens: 14.5% of calls are
+  longer in the trace, so the replay generates 48% of the recorded output tokens.
 - `--cuda-graph-max-bs-decode 32`: on a small GPU, SGLang sizes CUDA graphs for decode batches up to 8, and this
   replay runs more requests than that at once.
 - Add `--label "GitHub Copilot agent traces, June 2026"` to the collector to caption the dashboard.

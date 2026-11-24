@@ -9,7 +9,7 @@ only watch:
 - it accepts browsers only from the listed origins (--allow-origin);
 - it removes local file paths from the stream.
 
-  io-relay --upstream ws://127.0.0.1:18220/ws --port 18240 \\
+  io-relay --upstream ws://127.0.0.1:18200/ws --port 18240 \\
       --allow-origin https://<user>.github.io --trust-cloudflare
 """
 
@@ -203,7 +203,7 @@ def build_app(a: argparse.Namespace) -> web.Application:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Read-only public relay for the board stream")
-    ap.add_argument("--upstream", default="ws://127.0.0.1:18220/ws", help="the collector's board stream")
+    ap.add_argument("--upstream", default="ws://127.0.0.1:18200/ws", help="the collector's board stream")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18240)
     ap.add_argument("--allow-origin", action="append", default=[],

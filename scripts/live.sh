@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# The whole stack on one machine: SGLang with the tap on :18100, proxy :18000, collector :18220, advisor;
+# The whole stack on one machine: SGLang with the tap on :18100, proxy :18000, collector :18200, advisor;
 # then traffic, and optionally the push to a public relay.
 #   scripts/live.sh up        start the engine, proxy, collector and advisor, and wait for the engine
 #   scripts/live.sh copilot   replay GitHub Copilot agent sessions through the proxy (harness/copilot.py)
 #   scripts/live.sh load      replay $TRACE through the proxy (harness/replay.py)
 #   scripts/live.sh push      push the stream to the public relay at $PUSH_URL (harness/push.py)
+#   scripts/live.sh offline   stop the push and keep it stopped until the next push
 #   scripts/live.sh status    show what is running
-#   scripts/live.sh down      stop everything this script started
+#   scripts/live.sh ensure    restart what has stopped (for a timer; see scripts/systemd/)
+#   scripts/live.sh down      stop everything this script started, and keep it stopped until the next up
 # Settings come from the environment or scripts/live.env; see scripts/live.env.example.
-# Board: cd board && npm run dev, then http://127.0.0.1:18300/?ws=ws://127.0.0.1:18220/ws
+# Board: cd board && npm run dev, then http://127.0.0.1:18300/
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -27,6 +29,15 @@ start() { # name log cmd...
   echo $! > "$STATE/$name.pid"
 }
 
+# A process this script started: its pid file names a live process running SGLang or the harness
+# (after a reboot, a stale pid can belong to something else).
+alive() {
+  local f="$STATE/$1.pid" pid
+  [ -f "$f" ] || return 1
+  pid=$(cat "$f")
+  kill -0 "$pid" 2>/dev/null && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qE 'sglang|harness\.'
+}
+
 run_dir() {
   [ -f "$STATE/run" ] || { echo "no run yet: scripts/live.sh up"; exit 1; }
   cat "$STATE/run"
@@ -34,6 +45,7 @@ run_dir() {
 
 case "${1:-}" in
   up)
+    rm -f "$STATE/held"
     RUN="$ROOT/runs/local/live-$(date -u +%Y%m%d-%H%M%S)"
     mkdir -p "$RUN"
     echo "$RUN" > "$STATE/run"
@@ -44,7 +56,7 @@ case "${1:-}" in
       "$SGLANG_PY" -m sglang.launch_server --model-path "$MODEL" --host 127.0.0.1 --port 18100 --tp-size 1 \
       --enable-metrics --enable-cache-report --context-length "$CTX" ${ENGINE_ARGS:-}
     start collector "$RUN/collector.log" "$PY" -m harness.collector --engine sglang --model "$MODEL" --gpus "${GPU:-0}" \
-      --out "$RUN" --port 18220 --tap-port 18201 --notes "$RUN/notes.jsonl" ${LABEL:+--label "$LABEL"}
+      --out "$RUN" --port 18200 --tap-port 18201 --notes "$RUN/notes.jsonl" ${LABEL:+--label "$LABEL"}
     start proxy "$RUN/proxy.log" "$PY" -m harness.proxy --upstream http://127.0.0.1:18100 --events "$RUN/proxy.jsonl" \
       --rid-in-body
     for _ in $(seq 1 120); do
@@ -53,8 +65,8 @@ case "${1:-}" in
       sleep 3
     done
     curl -sf -o /dev/null http://127.0.0.1:18100/health || { echo "engine not healthy after 6 min"; exit 1; }
-    start advisor "$RUN/advisor.log" "$PY" -m harness.advisor --collector ws://127.0.0.1:18220/ws \
-      --post http://127.0.0.1:18220/note
+    start advisor "$RUN/advisor.log" "$PY" -m harness.advisor --collector ws://127.0.0.1:18200/ws \
+      --post http://127.0.0.1:18200/note
     echo "up: $RUN"
     ;;
   copilot)
@@ -73,13 +85,33 @@ case "${1:-}" in
     ;;
   push)
     RUN="$(run_dir)"
+    rm -f "$STATE/held.push"
     start push "$RUN/push.log" "$PY" -m harness.push --relay "${2:-${PUSH_URL:?set PUSH_URL, e.g. wss://live.<domain>/ingest}}"
     echo "push: $RUN/push.log"
     ;;
+  offline)
+    touch "$STATE/held.push"
+    if alive push; then kill -TERM "$(cat "$STATE/push.pid")"; fi
+    rm -f "$STATE/push.pid"
+    echo "offline: the public page shows its recording until scripts/live.sh push"
+    ;;
+  ensure)
+    [ -f "$STATE/held" ] && exit 0   # stopped with down
+    # The whole stack again if the engine, the proxy or the collector is gone; otherwise only what stopped.
+    if ! alive engine || ! alive proxy || ! alive collector; then
+      echo "ensure: restarting the stack"
+      "$0" down
+      "$0" up
+      "$0" copilot
+      if [ -n "${PUSH_URL:-}" ] && [ ! -f "$STATE/held.push" ]; then "$0" push; fi
+    else
+      if ! alive copilot && [ -n "${COPILOT_TRACE:-}" ]; then "$0" copilot; fi
+      if ! alive push && [ -n "${PUSH_URL:-}" ] && [ ! -f "$STATE/held.push" ]; then "$0" push; fi
+    fi
+    ;;
   status)
     for n in $NAMES; do
-      f="$STATE/$n.pid"
-      if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then echo "$n: running"; else echo "$n: stopped"; fi
+      if alive "$n"; then echo "$n: running"; else echo "$n: stopped"; fi
     done
     ;;
   down)
@@ -91,7 +123,8 @@ case "${1:-}" in
       for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       rm -f "$f"
     done
+    touch "$STATE/held"
     echo "down"
     ;;
-  *) echo "usage: $0 up|copilot|load|push|status|down"; exit 2 ;;
+  *) echo "usage: $0 up|copilot|load|push|offline|status|ensure|down"; exit 2 ;;
 esac

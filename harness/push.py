@@ -123,7 +123,7 @@ class Push:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Push the board stream out to the public relay")
-    ap.add_argument("--upstream", default="ws://127.0.0.1:18220/ws", help="the collector's board stream")
+    ap.add_argument("--upstream", default="ws://127.0.0.1:18200/ws", help="the collector's board stream")
     ap.add_argument("--relay", required=True, help="the relay's ingest URL, e.g. wss://live.<domain>/ingest")
     ap.add_argument("--token-file", type=Path, default=Path(os.path.expanduser("~/.config/inference-observe/push-token")))
     a = ap.parse_args()

@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 
 const [engine, events, secs = '60'] = process.argv.slice(2);
 const base = process.env.BOARD_URL ?? 'http://127.0.0.1:18300/';
-const ws = process.env.BOARD_WS ?? 'ws://127.0.0.1:18220/ws';
+const ws = process.env.BOARD_WS ?? 'ws://127.0.0.1:18200/ws';
 
 async function metrics() {
   const txt = await (await fetch(`${engine}/metrics`)).text();

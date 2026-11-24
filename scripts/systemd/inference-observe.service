@@ -1,0 +1,11 @@
+# Restarts whatever part of the live stack has stopped. Started by inference-observe.timer.
+# Install: see scripts/systemd/README.md.
+[Unit]
+Description=inference-observe live stack (restart what has stopped)
+
+[Service]
+Type=oneshot
+ExecStart=%h/inference-observe/scripts/live.sh ensure
+# The stack keeps running after this check exits.
+KillMode=process
+TimeoutStartSec=600

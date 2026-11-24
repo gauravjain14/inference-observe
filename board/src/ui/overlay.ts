@@ -178,12 +178,20 @@ export class Overlay {
     const live = s.status === 'connected' || s.status === 'playing' || s.status === 'mock';
     const down = s.status.startsWith('disconnected') || (s.status === 'connected' && !s.engineFresh(now) && s.events > 0);
     const statusTxt = s.status.startsWith('disconnected') ? 'engine restarting — reconnecting quietly' : down ? 'connected · waiting for engine' : s.status;
+    // On a public page that fell back to its recording, say why instead of when it was recorded.
+    const srcWhat = s.sourceNote
+      ? s.sourceNote
+      : h?.replay
+        ? `recorded ${h.replay.recorded_utc ?? ''} UTC${h.replay.speed && h.replay.speed !== 1 ? ` · ${h.replay.speed}× speed` : ''}`
+        : statusTxt;
+    const srcName = s.sourceNote ? 'recording' : h?.replay ? 'replay' : s.sourceLabel;
+    const srcLine = `<div class="src" title="${esc(`${srcName} · ${srcWhat}`)}"><span class="dot ${live && !s.sourceNote && !h?.replay ? 'on' : ''}"></span><b>${esc(srcName)}</b> · ${esc(srcWhat)}</div>`;
     this.caption.innerHTML = `
       <div class="plate">Plate I · ${esc(h?.label ?? 'Live specimen')}${gpus ? ` · ${gpus} ${gpus > 1 ? 'GPUs' : 'GPU'}` : ''}</div>
       <h1 title="${esc(`${engine} · ${model}`)}">${esc(engine)} <em>·</em> ${esc(model)}</h1>
       <p>Requests in crimson, KV cache in ultramarine, compute in sap green.</p>
       ${cfg ? `<div class="cfg">${cfg}</div>` : ''}
-      <div class="src"><span class="dot ${live ? 'on' : ''}"></span><b>${esc(h?.replay ? 'replay' : s.sourceLabel)}</b> · ${esc(h?.replay ? `recorded ${h.replay.recorded_utc ?? ''} UTC${h.replay.speed && h.replay.speed !== 1 ? ` · ${h.replay.speed}× speed` : ''}` : statusTxt)}</div>`;
+      ${srcLine}`;
 
     const m = (k: string, v: string | null, sub = '', unit = '') =>
       `<div class="m"><span class="k">${k}${v != null ? ` ${tag(k === 'ttft p50' || (k === 'tokens/s' && st.tokSource !== 'engine') || (k === 'running' && st.running == null) ? 'd' : 'm')}` : ''}</span><span class="v ${v == null ? 'un' : ''}">${v ?? '—'}${v != null && unit ? `<small>${unit}</small>` : ''}</span>${sub ? `<span class="sub">${sub}</span>` : ''}</div>`;

@@ -11,6 +11,7 @@ export type Mode = 'live' | 'paused' | 'replay';
 
 export class TimeCtl {
   mode: Mode = 'live';
+  headLabel = 'live'; // what following the newest event is called: 'live' on a feed, 'latest' in a recording
   private buf: { lt: number; m: Msg }[] = [];
   private head = 0; // index of the oldest kept event (buffer is compacted lazily)
   private lastHello: Msg | null = null;
@@ -157,7 +158,8 @@ export class TimeCtl {
     const mm = Math.floor(behind / 60_000);
     const ss = Math.floor((behind % 60_000) / 1000);
     this.label.textContent =
-      this.mode === 'live' ? 'live' : this.mode === 'paused' ? `paused · −${mm}:${String(ss).padStart(2, '0')}` : `replay · −${mm}:${String(ss).padStart(2, '0')}`;
+      this.mode === 'live' ? this.headLabel : this.mode === 'paused' ? `paused · −${mm}:${String(ss).padStart(2, '0')}` : `replay · −${mm}:${String(ss).padStart(2, '0')}`;
+    this.liveBtn.textContent = `● ${this.headLabel}`;
     this.liveBtn.style.display = this.mode === 'live' ? 'none' : 'inline-block';
     const held = Math.min(KEEP_MS, now - (this.buf[this.head]?.lt ?? now));
     this.range.min = String(-Math.max(1, Math.round(held / 1000)));

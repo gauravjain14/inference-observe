@@ -83,6 +83,7 @@ function pickSource(): Source {
 
 let source = pickSource();
 store.sourceLabel = source.label;
+if (!(source instanceof WsSource)) time.headLabel = 'latest';
 source.start(emit, status);
 
 // Live is the default; if the socket never connects, fall back so the plate isn't empty: a public build plays its
@@ -93,6 +94,8 @@ if (source instanceof WsSource && (PUBLIC_WS || !params.has('ws')) && params.get
       source.stop();
       source = PUBLIC_WS ? new ReplaySource(PUBLIC_FALLBACK, 1, true) : new MockSource('steady');
       store.sourceLabel = PUBLIC_WS ? source.label : `${source.label} (live socket unavailable)`;
+      if (PUBLIC_WS) store.sourceNote = 'live feed busy or offline · reload to retry';
+      time.headLabel = 'latest';
       source.start(emit, status);
     }
   }, 4000);

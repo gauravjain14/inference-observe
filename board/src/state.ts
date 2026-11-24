@@ -261,6 +261,7 @@ export class Store {
   private admitBucket = 0;
   status = 'connecting';
   sourceLabel = '';
+  sourceNote = ''; // why the board is not on the live feed, shown after the source
   events = 0;
 
   ingest(m: Msg, now = performance.now()): void {
@@ -663,7 +664,7 @@ export class Store {
 
   /** Forget everything (used by the time scrubber before replaying the buffer). */
   reset(): void {
-    const keep = { status: this.status, sourceLabel: this.sourceLabel };
+    const keep = { status: this.status, sourceLabel: this.sourceLabel, sourceNote: this.sourceNote };
     Object.assign(this, new Store(), keep);
   }
 

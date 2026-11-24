@@ -1,10 +1,10 @@
 // Evaluation suite: screenshot the board across viewports, modes and interactions, and record
 // console errors and frame times. Output: shots/eval/<case>.png + shots/eval/report.json
-//   BOARD_URL=http://127.0.0.1:18310/ node scripts/evaluate.mjs [filter]
+//   BOARD_URL=http://127.0.0.1:18300/ node scripts/evaluate.mjs [filter]
 import { chromium } from 'playwright';
 import { mkdirSync, writeFileSync } from 'node:fs';
 
-const base = process.env.BOARD_URL ?? 'http://127.0.0.1:18310/';
+const base = process.env.BOARD_URL ?? 'http://127.0.0.1:18300/';
 const only = process.argv[2] ?? '';
 mkdirSync('shots/eval', { recursive: true });
 
@@ -17,7 +17,7 @@ const cases = [
   { name: 'replay-1600-later', q: '', w: 1600, h: 900, wait: 40 },
   { name: 'memmap-1600', q: '', w: 1600, h: 900, wait: 12, keys: ['m'], after: 3 },
   { name: 'zoom-kv-1600', q: '', w: 1600, h: 900, wait: 12, zoom: { at: 'kv', steps: 6 } },
-  { name: 'hover-fig4-1600', q: '', w: 1600, h: 900, wait: 12, hover: { sel: '.fig4 canvas', fx: 0.42, fy: 0.5 } },
+  { name: 'hover-fig4-1600', q: '', w: 1600, h: 900, wait: 12, hover: { sel: '.fig5 canvas, .fig4 canvas', fx: 0.42, fy: 0.5 } },
   { name: 'inspect-kv-1600', q: '', w: 1600, h: 900, wait: 12, click: 'kv' },
   { name: 'mock-burst-1600', q: 'mock=burst', w: 1600, h: 900, wait: 20 },
   { name: 'mock-pd-1600', q: 'mock=pd', w: 1600, h: 900, wait: 14 },
@@ -59,7 +59,9 @@ for (const c of cases) {
     } else errors.push(`no anchor for ${c.zoom.at}`);
   }
   if (c.hover) {
-    const box = await page.locator(c.hover.sel).boundingBox();
+    const target = page.locator(c.hover.sel).filter({ visible: true }).first(); // dense models show Fig. 4 as .fig5, MoE models as .fig4
+    await target.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    const box = await target.boundingBox();
     if (box) { await page.mouse.move(box.x + box.width * c.hover.fx, box.y + box.height * c.hover.fy); await page.waitForTimeout(900); }
     else errors.push(`no element ${c.hover.sel}`);
   }

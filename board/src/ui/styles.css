@@ -17,6 +17,8 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--paper)
 body { font-family: var(--serif); -webkit-font-smoothing: antialiased; }
 canvas#plate { position: fixed; inset: 0; display: block; }
 #overlay { position: fixed; inset: 0; pointer-events: none; }
+.repo { position: fixed; top: 11px; right: 28px; z-index: 5; pointer-events: auto; font: 400 10.5px/1 var(--mono); letter-spacing: 0.06em; color: var(--muted); text-decoration: none; }
+.repo:hover { color: var(--crimson); text-decoration: underline; }
 
 .caption { position: absolute; left: 36px; top: 30px; max-width: 720px; }
 .caption .plate { font: 500 10.5px/1 var(--mono); letter-spacing: 0.22em; text-transform: uppercase; color: var(--crimson); }

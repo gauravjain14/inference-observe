@@ -65,6 +65,8 @@ const status = (s: string) => {
 // links cannot point it at another server with ?ws= or ?replay=.
 const PUBLIC_WS: string | undefined = import.meta.env.VITE_PUBLIC_WS || undefined;
 const PUBLIC_FALLBACK = 'samples/sglang-copilot-agent.jsonl';
+// Where a public page links for its source (VITE_PUBLIC_REPO at build time).
+const PUBLIC_REPO: string = import.meta.env.VITE_PUBLIC_REPO || 'https://github.com/gauravjain14/inference-observe';
 const sameOrigin = (u: string) => {
   try {
     return new URL(u, location.href).origin === location.origin;
@@ -79,6 +81,16 @@ function pickSource(): Source {
   const replay = params.get('replay');
   if (replay && (!PUBLIC_WS || sameOrigin(replay))) return new ReplaySource(replay, Number(params.get('speed') ?? 1) || 1, params.get('loop') === '1');
   return new WsSource(PUBLIC_WS ?? params.get('ws') ?? 'ws://127.0.0.1:18200/ws');
+}
+
+if (PUBLIC_WS) {
+  const a = document.createElement('a');
+  a.className = 'repo';
+  a.href = PUBLIC_REPO;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = 'source on GitHub ↗';
+  root.appendChild(a);
 }
 
 let source = pickSource();

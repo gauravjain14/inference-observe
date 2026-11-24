@@ -390,7 +390,8 @@ VITE_PUBLIC_WS=wss://live.<domain>/ws npx vite build --base=/<repo>/
 A build with `VITE_PUBLIC_WS`:
 - shows only that feed and recordings from its own site; `?ws=` and other sites' `?replay=` are ignored;
 - carries a Content-Security-Policy that allows only its own files and that feed;
-- plays the bundled recording when the feed is unavailable.
+- plays the bundled recording when the feed is unavailable;
+- links to its source: this repository, or `VITE_PUBLIC_REPO` if set.
 
 Publish `board/dist/` on a `gh-pages` branch, then choose **Settings → Pages → Deploy from a branch**.
 

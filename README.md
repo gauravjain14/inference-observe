@@ -238,6 +238,8 @@ io-copilot 'date=2026-06-06' --start 2026-06-06T13:00 --duration 14400 \
   fit a 16 GB GPU, with a 166k-token KV cache.
 - `--cuda-graph-max-bs-decode 32`: on a small GPU, SGLang sizes CUDA graphs for decode batches up to 8,
   and this replay runs more requests than that at once.
+- `scripts/live.sh` runs all of this with the settings in `scripts/live.env` (copy `scripts/live.env.example`):
+  `scripts/live.sh up`, then `scripts/live.sh copilot`; `scripts/live.sh status` and `scripts/live.sh down`.
 - Every 30 s, `runs/live/copilot.log` gets a line with the share of prompt tokens the engine served
   from its cache, next to production's, per traffic class. When the replay stops it writes
   `copilot-summary.json` and `copilot-calls.jsonl`.
@@ -410,6 +412,7 @@ default 1).
 | `taps/` | engine plugins: SGLang (`sglang.srt.plugins`) and vLLM (`vllm.stat_logger_plugins`) |
 | `harness/` | proxy, collector, advisor, agent-session replay, public push and relay, replay tools, trace converters, expert sampler |
 | `relay-worker/` | the public relay on Cloudflare (Worker and Durable Object) |
+| `scripts/` | `live.sh`: the whole stack on one machine |
 | `board/` | the board (TypeScript, WebGL2, Vite); `scripts/evaluate.mjs` is its visual test suite |
 | `docs/events.md` | the event format |
 

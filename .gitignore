@@ -5,6 +5,7 @@ __pycache__/
 node_modules/
 dist/
 runs/
-traces/*.jsonl
 board/shots/
 .DS_Store
+traces/
+scripts/live.env
